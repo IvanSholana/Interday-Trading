@@ -281,6 +281,7 @@ Stage 1 menghasilkan dua penilaian berbeda:
   - `min_value`: transaction value hari terakhir di bawah threshold minimum.
   - `min_volume_ratio`: volume ratio hari terakhir di bawah threshold aktivitas minimum.
   - `max_return_5d`: return 5 hari terlalu tinggi (anti-chasing, menghindari beli setelah naik banyak).
+  - `min_active_days_20d`: jumlah hari aktif (volume > 0) dalam 20 sesi terakhir kurang dari threshold.
 - `INVALID_DATA`: data kurang 20 hari atau tidak valid.
 
 Dengan ini, saham bisa tetap `HIGH_LIQUIDITY` (likuid secara absolut) tetapi `AVOID_FOR_NOW` di trade candidate bucket karena value_est, volume_ratio, atau return_5d tidak memenuhi gate hari ini.

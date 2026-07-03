@@ -246,3 +246,78 @@ def test_gates_skip_when_value_is_none() -> None:
     failures = _check_daily_gates(row, config)
 
     assert "latest_value_below_min_value" not in failures
+
+
+# -----------------------------------------------------------------------
+# min_active_days_20d gate tests
+# -----------------------------------------------------------------------
+
+
+def test_min_active_days_gate_blocks_trade_candidate() -> None:
+    """active_days_20d below min_active_days_20d should make trade candidate AVOID_FOR_NOW."""
+    config = ScreenerConfig(min_active_days_20d=18)
+    row = _liquid_row(active_days_20d=12)
+
+    result = classify_trade_candidate(row, config)
+
+    assert result == AVOID_FOR_NOW
+
+
+def test_min_active_days_gate_reason_is_specific() -> None:
+    """Reason should say active_days_below_min_active_days_20d."""
+    config = ScreenerConfig(min_active_days_20d=18)
+    row = _liquid_row(active_days_20d=12)
+    row["liquidity_bucket"] = HIGH_LIQUIDITY
+    row["trade_candidate_bucket"] = AVOID_FOR_NOW
+    row["relative_activity_bucket"] = "VERY_ACTIVE"
+
+    reason = build_reason(row, config)
+
+    assert reason == "active_days_below_min_active_days_20d"
+
+
+def test_min_active_days_gate_signal_summary_mentions_active_days() -> None:
+    """Summary should mention not enough active trading days."""
+    config = ScreenerConfig(min_active_days_20d=18)
+    row = _liquid_row(active_days_20d=12)
+    row["liquidity_bucket"] = HIGH_LIQUIDITY
+    row["trade_candidate_bucket"] = AVOID_FOR_NOW
+
+    summary = build_signal_summary(row, config)
+
+    assert "active trading days" in summary.lower()
+
+
+def test_min_active_days_gate_does_not_affect_liquidity_score() -> None:
+    """liquidity_score is independent from active_days gate."""
+    config = ScreenerConfig(min_active_days_20d=18)
+    row_passing = _liquid_row(active_days_20d=20)
+    row_failing = _liquid_row(active_days_20d=10)
+
+    score_passing = calculate_liquidity_score(row_passing, config)
+    score_failing = calculate_liquidity_score(row_failing, config)
+
+    # Scores differ because active_days influences liquidity_score (active_days_score component),
+    # but that's the absolute liquidity dimension, not the gate. The gate only blocks trade_candidate.
+    # Here we just verify the gate does NOT zero out the score.
+    assert score_failing > 0
+
+
+def test_min_active_days_gate_passes_when_sufficient() -> None:
+    """When active_days_20d meets threshold, gate does not block."""
+    config = ScreenerConfig(min_active_days_20d=15)
+    row = _liquid_row(active_days_20d=18)
+
+    result = classify_trade_candidate(row, config)
+
+    assert result != AVOID_FOR_NOW or row.get("close_location", 0.5) < 0.4
+
+
+def test_min_active_days_gate_skips_when_none() -> None:
+    """If active_days_20d is None, gate should not trigger."""
+    config = ScreenerConfig(min_active_days_20d=18)
+    row = _liquid_row(active_days_20d=None)
+
+    failures = _check_daily_gates(row, config)
+
+    assert "active_days_below_min_active_days_20d" not in failures

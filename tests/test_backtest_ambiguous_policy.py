@@ -159,6 +159,7 @@ def test_skip_trade_not_counted_in_metrics_win_loss() -> None:
             "mfe_pct": 0.05,
             "mae_pct": -0.05,
             "exit_date": "2026-01-02",
+            "same_day_ambiguous": True,
         },
         {
             "backtest_status": "CLOSED_TRADE",
@@ -172,6 +173,7 @@ def test_skip_trade_not_counted_in_metrics_win_loss() -> None:
             "mfe_pct": 0.05,
             "mae_pct": -0.01,
             "exit_date": "2026-01-03",
+            "same_day_ambiguous": False,
         },
     ])
 
@@ -220,3 +222,76 @@ def test_non_ambiguous_tp_hit_unaffected_by_policy() -> None:
         assert result["exit_reason"] == "TP1_HIT", f"Failed for policy={policy}"
         assert result["same_day_ambiguous"] is False, f"Failed for policy={policy}"
         assert result["backtest_status"] == "CLOSED_TRADE", f"Failed for policy={policy}"
+
+
+# -----------------------------------------------------------------------
+# ambiguous_trade_count counts same_day_ambiguous=True across all policies
+# -----------------------------------------------------------------------
+
+
+def test_ambiguous_count_stop_first_increments() -> None:
+    """stop_first ambiguous closed trade increments ambiguous_trade_count."""
+    config = InterdayBacktestConfig(
+        slippage_pct=0, buy_fee_pct=0, sell_fee_pct=0,
+        same_day_ambiguous_policy="stop_first",
+    )
+    result = simulate_interday_signal(_signal_row(), _ambiguous_history(), config)
+
+    trades = pd.DataFrame([result])
+    metrics = calculate_backtest_metrics(trades, initial_capital=1000)
+
+    assert result["same_day_ambiguous"] is True
+    assert result["backtest_status"] == "CLOSED_TRADE"
+    assert metrics["ambiguous_trade_count"] == 1
+
+
+def test_ambiguous_count_tp_first_increments() -> None:
+    """tp_first ambiguous closed trade increments ambiguous_trade_count."""
+    config = InterdayBacktestConfig(
+        slippage_pct=0, buy_fee_pct=0, sell_fee_pct=0,
+        same_day_ambiguous_policy="tp_first",
+    )
+    result = simulate_interday_signal(_signal_row(), _ambiguous_history(), config)
+
+    trades = pd.DataFrame([result])
+    metrics = calculate_backtest_metrics(trades, initial_capital=1000)
+
+    assert result["same_day_ambiguous"] is True
+    assert result["backtest_status"] == "CLOSED_TRADE"
+    assert metrics["ambiguous_trade_count"] == 1
+
+
+def test_ambiguous_count_skip_trade_increments() -> None:
+    """skip_trade ambiguous skipped trade also increments ambiguous_trade_count."""
+    config = InterdayBacktestConfig(
+        slippage_pct=0, buy_fee_pct=0, sell_fee_pct=0,
+        same_day_ambiguous_policy="skip_trade",
+    )
+    result = simulate_interday_signal(_signal_row(), _ambiguous_history(), config)
+
+    trades = pd.DataFrame([result])
+    metrics = calculate_backtest_metrics(trades, initial_capital=1000)
+
+    assert result["same_day_ambiguous"] is True
+    assert result["backtest_status"] == "AMBIGUOUS_SKIPPED"
+    assert metrics["ambiguous_trade_count"] == 1
+
+
+def test_ambiguous_count_non_ambiguous_is_zero() -> None:
+    """Non-ambiguous trade should not increment ambiguous_trade_count."""
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02"])
+    history = pd.DataFrame(
+        [
+            {"open": 990, "high": 1000, "low": 980, "close": 995, "volume": 1_000_000},
+            {"open": 1000, "high": 1060, "low": 960, "close": 1050, "volume": 2_000_000},
+        ],
+        index=dates,
+    )
+    config = InterdayBacktestConfig(slippage_pct=0, buy_fee_pct=0, sell_fee_pct=0)
+    result = simulate_interday_signal(_signal_row(stop_loss=955), history, config)
+
+    trades = pd.DataFrame([result])
+    metrics = calculate_backtest_metrics(trades, initial_capital=1000)
+
+    assert result["same_day_ambiguous"] is False
+    assert metrics["ambiguous_trade_count"] == 0

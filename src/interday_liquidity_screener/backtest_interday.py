@@ -467,7 +467,7 @@ def calculate_backtest_metrics(trades: pd.DataFrame, initial_capital: float = 10
         "entry_triggered_count": triggered_count,
         "entry_not_triggered_count": int((trades["backtest_status"] == "ENTRY_NOT_TRIGGERED").sum()) if not trades.empty else 0,
         "entry_rejected_gap_count": int((trades["backtest_status"] == "ENTRY_REJECTED_GAP_TOO_HIGH").sum()) if not trades.empty else 0,
-        "ambiguous_trade_count": int((trades["backtest_status"] == "AMBIGUOUS_SKIPPED").sum()) if not trades.empty else 0,
+        "ambiguous_trade_count": int(trades["same_day_ambiguous"].astype(bool).sum()) if not trades.empty and "same_day_ambiguous" in trades.columns else 0,
         "win_count": int(len(wins)),
         "loss_count": int(len(losses)),
         "win_rate": float(len(wins) / triggered_count) if triggered_count else 0.0,

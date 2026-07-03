@@ -91,6 +91,10 @@ def _check_daily_gates(row: dict[str, Any], config: ScreenerConfig) -> list[str]
     if return_5d is not None and return_5d > config.max_return_5d:
         failures.append("return_5d_above_max_return_5d")
 
+    active_days_20d = row.get("active_days_20d")
+    if active_days_20d is not None and active_days_20d < config.min_active_days_20d:
+        failures.append("active_days_below_min_active_days_20d")
+
     return failures
 
 
@@ -211,6 +215,8 @@ def build_signal_summary(row: dict[str, Any], config: ScreenerConfig | None = No
                 parts.append("today's volume ratio is below the minimum activity threshold")
             if "return_5d_above_max_return_5d" in gate_failures:
                 parts.append("5-day return is too high (avoid chasing)")
+            if "active_days_below_min_active_days_20d" in gate_failures:
+                parts.append("not enough active trading days in the last 20 sessions")
             return f"{liquid_text}, but {'; '.join(parts)}. Not eligible as trade candidate today."
 
     if trade_bucket == STRONG_WATCH:
