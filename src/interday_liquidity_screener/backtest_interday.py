@@ -9,6 +9,7 @@ import pandas as pd
 
 
 VALID_ENTRY_MODES = {"next_open", "next_day_entry_zone"}
+VALID_AMBIGUOUS_POLICIES = {"stop_first", "tp_first", "skip_trade"}
 SUPPORT_COLUMNS = [
     "ticker",
     "yahoo_ticker",
@@ -81,8 +82,8 @@ class InterdayBacktestConfig:
             raise ValueError(f"entry_mode must be one of {', '.join(sorted(VALID_ENTRY_MODES))}")
         if self.exit_policy != "tp1_exit":
             raise ValueError("Only exit_policy='tp1_exit' is supported in Stage 5A MVP")
-        if self.same_day_ambiguous_policy != "stop_first":
-            raise ValueError("Only same_day_ambiguous_policy='stop_first' is supported in Stage 5A MVP")
+        if self.same_day_ambiguous_policy not in VALID_AMBIGUOUS_POLICIES:
+            raise ValueError(f"same_day_ambiguous_policy must be one of {', '.join(sorted(VALID_AMBIGUOUS_POLICIES))}")
 
 
 def _is_true(value: Any) -> bool:
@@ -334,10 +335,17 @@ def _exit_trade(
         tp1_hit = high >= tp1
         sl_hit = low <= stop_loss
         if tp1_hit and sl_hit:
-            exit_reason = "SL_HIT_SAME_DAY_AMBIGUOUS"
-            exit_price = stop_loss * (1 - config.slippage_pct)
-            exit_position = offset
             same_day_ambiguous = True
+            if config.same_day_ambiguous_policy == "stop_first":
+                exit_reason = "SL_HIT_SAME_DAY_AMBIGUOUS"
+                exit_price = stop_loss * (1 - config.slippage_pct)
+            elif config.same_day_ambiguous_policy == "tp_first":
+                exit_reason = "TP1_HIT_SAME_DAY_AMBIGUOUS"
+                exit_price = tp1 * (1 - config.slippage_pct)
+            else:  # skip_trade
+                exit_reason = "AMBIGUOUS_SKIPPED"
+                exit_price = float(bar["close"]) * (1 - config.slippage_pct)
+            exit_position = offset
             break
         if sl_hit:
             exit_reason = "SL_HIT"
@@ -397,6 +405,22 @@ def simulate_interday_signal(
     shares = lots * config.lot_size
     position_value = shares * actual_entry_price
     exit_result = _exit_trade(history, entry_index, actual_entry_price, row, config)
+
+    # Handle skip_trade policy: ambiguous trades get a special status
+    if exit_result["exit_reason"] == "AMBIGUOUS_SKIPPED":
+        result.update(exit_result)
+        result.update(
+            {
+                "backtest_status": "AMBIGUOUS_SKIPPED",
+                "gross_return_pct": pd.NA,
+                "net_return_pct": pd.NA,
+                "net_pnl_amount": pd.NA,
+                "shares": shares,
+                "position_value": position_value,
+            }
+        )
+        return result
+
     gross_return_pct = (float(exit_result["exit_price"]) - actual_entry_price) / actual_entry_price
     net_return_pct = gross_return_pct - config.buy_fee_pct - config.sell_fee_pct
 
@@ -443,6 +467,7 @@ def calculate_backtest_metrics(trades: pd.DataFrame, initial_capital: float = 10
         "entry_triggered_count": triggered_count,
         "entry_not_triggered_count": int((trades["backtest_status"] == "ENTRY_NOT_TRIGGERED").sum()) if not trades.empty else 0,
         "entry_rejected_gap_count": int((trades["backtest_status"] == "ENTRY_REJECTED_GAP_TOO_HIGH").sum()) if not trades.empty else 0,
+        "ambiguous_trade_count": int((trades["backtest_status"] == "AMBIGUOUS_SKIPPED").sum()) if not trades.empty else 0,
         "win_count": int(len(wins)),
         "loss_count": int(len(losses)),
         "win_rate": float(len(wins) / triggered_count) if triggered_count else 0.0,

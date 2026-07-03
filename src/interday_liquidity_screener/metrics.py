@@ -60,9 +60,9 @@ def apply_screening_labels(metrics: dict[str, Any], config: ScreenerConfig) -> d
     metrics["liquidity_score"] = score
     metrics["liquidity_bucket"] = classify_liquidity_bucket(score)
     metrics["relative_activity_bucket"] = classify_relative_activity(metrics)
-    metrics["trade_candidate_bucket"] = classify_trade_candidate(metrics)
-    metrics["reason"] = build_reason(metrics)
-    metrics["signal_summary"] = build_signal_summary(metrics)
+    metrics["trade_candidate_bucket"] = classify_trade_candidate(metrics, config)
+    metrics["reason"] = build_reason(metrics, config)
+    metrics["signal_summary"] = build_signal_summary(metrics, config)
     return metrics
 
 

@@ -125,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     stage5a.add_argument("--initial-capital", type=float, default=10_000_000)
     stage5a.add_argument("--max-entry-gap-pct", type=float, default=0.03)
     stage5a.add_argument("--allow-entry-gap-too-high", action="store_true")
+    stage5a.add_argument("--same-day-ambiguous-policy", choices=["stop_first", "tp_first", "skip_trade"], default="stop_first")
     stage5a.add_argument("--refresh-price-cache", action="store_true")
 
     stage5b = subparsers.add_parser("stage5-paper-bpjs", help="Create BPJS forward paper trading journal from Stage 4.")
@@ -267,6 +268,7 @@ def main() -> None:
             initial_capital=args.initial_capital,
             max_entry_gap_pct=args.max_entry_gap_pct,
             reject_if_entry_gap_too_high=not args.allow_entry_gap_too_high,
+            same_day_ambiguous_policy=args.same_day_ambiguous_policy,
             refresh_price_cache=args.refresh_price_cache,
         )
         run_stage5_backtest_interday(args.signals, args.output, args.metrics_output, args.equity_output, config)

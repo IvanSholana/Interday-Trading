@@ -72,7 +72,29 @@ def classify_relative_activity(row: dict[str, Any]) -> str:
     return QUIET
 
 
-def classify_trade_candidate(row: dict[str, Any]) -> str:
+def _check_daily_gates(row: dict[str, Any], config: ScreenerConfig) -> list[str]:
+    """Check daily activity gates that determine trade candidacy but not absolute liquidity.
+
+    Returns a list of gate failure reasons, or empty list if all gates pass.
+    """
+    failures: list[str] = []
+
+    value_est = row.get("value_est")
+    if value_est is not None and value_est < config.min_value:
+        failures.append("latest_value_below_min_value")
+
+    volume_ratio = row.get("volume_ratio")
+    if volume_ratio is not None and volume_ratio < config.min_volume_ratio:
+        failures.append("volume_ratio_below_min_volume_ratio")
+
+    return_5d = row.get("return_5d")
+    if return_5d is not None and return_5d > config.max_return_5d:
+        failures.append("return_5d_above_max_return_5d")
+
+    return failures
+
+
+def classify_trade_candidate(row: dict[str, Any], config: ScreenerConfig | None = None) -> str:
     if not row.get("is_data_valid") or _value(row, "data_points") < 20:
         return INVALID_DATA
 
@@ -80,6 +102,12 @@ def classify_trade_candidate(row: dict[str, Any]) -> str:
     is_liquid = liquidity_bucket in {HIGH_LIQUIDITY, GOOD_LIQUIDITY}
     if not is_liquid:
         return AVOID_FOR_NOW
+
+    # Check config-based daily gates
+    if config is not None:
+        gate_failures = _check_daily_gates(row, config)
+        if gate_failures:
+            return AVOID_FOR_NOW
 
     return_1d = row.get("return_1d")
     return_3d = row.get("return_3d")
@@ -117,7 +145,7 @@ def classify_trade_candidate(row: dict[str, Any]) -> str:
     return AVOID_FOR_NOW
 
 
-def build_reason(row: dict[str, Any]) -> str:
+def build_reason(row: dict[str, Any], config: ScreenerConfig | None = None) -> str:
     if not row.get("is_data_valid") or _value(row, "data_points") < 20:
         source_reason = row.get("reason")
         if source_reason and source_reason not in {"", "invalid_data"}:
@@ -140,6 +168,13 @@ def build_reason(row: dict[str, Any]) -> str:
 
     if not high_liquidity:
         return "low_liquidity_or_inconsistent_trading"
+
+    # Check config-based daily gates and return specific reasons
+    if config is not None and high_liquidity:
+        gate_failures = _check_daily_gates(row, config)
+        if gate_failures:
+            return gate_failures[0]
+
     if trade_bucket == STRONG_WATCH and positive_rebound:
         return "high_liquidity_with_positive_rebound"
     if close_location < 0.4:
@@ -151,7 +186,7 @@ def build_reason(row: dict[str, Any]) -> str:
     return "high_liquidity_neutral_setup"
 
 
-def build_signal_summary(row: dict[str, Any]) -> str:
+def build_signal_summary(row: dict[str, Any], config: ScreenerConfig | None = None) -> str:
     if not row.get("is_data_valid") or _value(row, "data_points") < 20:
         return "Invalid or insufficient data. Skip this ticker until a full 20-day history is available."
 
@@ -164,6 +199,19 @@ def build_signal_summary(row: dict[str, Any]) -> str:
     close_location = _value(row, "close_location", 0.5)
 
     liquid_text = "Very liquid stock" if liquidity_bucket == HIGH_LIQUIDITY else "Liquid stock"
+
+    # Check config-based daily gates and return descriptive summaries
+    if config is not None and liquidity_bucket in {HIGH_LIQUIDITY, GOOD_LIQUIDITY}:
+        gate_failures = _check_daily_gates(row, config)
+        if gate_failures:
+            parts = []
+            if "latest_value_below_min_value" in gate_failures:
+                parts.append("today's transaction value is below the minimum threshold")
+            if "volume_ratio_below_min_volume_ratio" in gate_failures:
+                parts.append("today's volume ratio is below the minimum activity threshold")
+            if "return_5d_above_max_return_5d" in gate_failures:
+                parts.append("5-day return is too high (avoid chasing)")
+            return f"{liquid_text}, but {'; '.join(parts)}. Not eligible as trade candidate today."
 
     if trade_bucket == STRONG_WATCH:
         if any(value is not None and value < 0 for value in [return_3d, return_5d]):

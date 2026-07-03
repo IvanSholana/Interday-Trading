@@ -149,6 +149,7 @@ python main.py stage5-backtest-interday `
   --buy-fee-pct 0.0015 `
   --sell-fee-pct 0.0025 `
   --slippage-pct 0.001 `
+  --same-day-ambiguous-policy stop_first `
   --initial-capital 10000000
 ```
 
@@ -262,13 +263,27 @@ Ticker akan otomatis dinormalisasi menjadi format Yahoo Finance IDX, misalnya `B
 
 ## Metode Screening
 
-Bucket likuiditas absolut:
+Stage 1 menghasilkan dua penilaian berbeda:
+
+**Liquidity bucket** = kualitas likuiditas absolut 20 hari, independen dari setup harian:
 
 - `HIGH_LIQUIDITY`: likuiditas sangat tinggi dan konsisten.
 - `GOOD_LIQUIDITY`: cukup likuid untuk lanjut screening.
 - `MEDIUM_LIQUIDITY`: ada likuiditas, tetapi belum cukup kuat untuk pipeline utama.
 - `LOW_LIQUIDITY`: likuiditas rendah.
 - `ILLIQUID`: nilai transaksi rendah, tidak konsisten, atau data tidak valid.
+
+**Trade candidate bucket** = kelayakan awal sebagai watchlist hari ini, berdasarkan likuiditas + aktivitas harian + anti-chasing filter:
+
+- `STRONG_WATCH`: likuid, aktif hari ini, tidak over-extended — eligible masuk watchlist.
+- `WATCH`: cukup menarik tetapi belum semua syarat terpenuhi.
+- `AVOID_FOR_NOW`: likuiditas tidak cukup, atau gagal salah satu gate harian:
+  - `min_value`: transaction value hari terakhir di bawah threshold minimum.
+  - `min_volume_ratio`: volume ratio hari terakhir di bawah threshold aktivitas minimum.
+  - `max_return_5d`: return 5 hari terlalu tinggi (anti-chasing, menghindari beli setelah naik banyak).
+- `INVALID_DATA`: data kurang 20 hari atau tidak valid.
+
+Dengan ini, saham bisa tetap `HIGH_LIQUIDITY` (likuid secara absolut) tetapi `AVOID_FOR_NOW` di trade candidate bucket karena value_est, volume_ratio, atau return_5d tidak memenuhi gate hari ini.
 
 Metrik penting:
 
@@ -302,7 +317,15 @@ Stage 3C mengambil snapshot orderbook live/intraday untuk memeriksa kualitas eks
 
 Stage 4 membuat trade plan final hanya jika Stage 2 dan Stage 3B sama-sama mendukung. Default-nya Stage 4 memakai `strategy_mode=interday`, sehingga broker confirmation tetap wajib tetapi orderbook tidak otomatis menjadi gate. Gunakan `--allow-trade-without-broker-data` hanya untuk mode eksplorasi. Jika `--orderbook` diberikan, kolom orderbook ikut muncul di output sebagai `execution_quality_note`. Jika `--require-orderbook-confirmation` dipakai, trade plan aktif hanya lolos bila `orderbook_status` `ORDERBOOK_SUPPORTIVE` atau `ORDERBOOK_NEUTRAL`. Untuk `strategy_mode=bpjs`, orderbook confirmation aktif secara default dan risiko spread/depth/orderbook dapat menggugurkan trade.
 
-Stage 5 adalah validation layer, bukan signal layer. Stage 5A mengevaluasi output Stage 4 interday memakai OHLCV daily: entry, TP, SL, time stop, fee, slippage, MFE/MAE, metrics JSON, dan equity curve. Jika TP dan SL tersentuh pada candle yang sama, backtest memakai asumsi konservatif: SL dianggap kena dulu.
+Stage 5 adalah validation layer, bukan signal layer. Stage 5A mengevaluasi output Stage 4 interday memakai OHLCV daily: entry, TP, SL, time stop, fee, slippage, MFE/MAE, metrics JSON, dan equity curve.
+
+Jika TP dan SL tersentuh pada candle yang sama (same-day ambiguity), backtest memakai `--same-day-ambiguous-policy` yang configurable:
+
+- `stop_first` (default, konservatif): SL dianggap kena dulu. Exit reason = `SL_HIT_SAME_DAY_AMBIGUOUS`.
+- `tp_first` (optimistis): TP dianggap kena dulu. Exit reason = `TP1_HIT_SAME_DAY_AMBIGUOUS`.
+- `skip_trade`: trade ambigu tidak dihitung sebagai closed trade. Status = `AMBIGUOUS_SKIPPED`. Metrics tidak memasukkan trade ini ke win/loss.
+
+Field `ambiguous_trade_count` di metrics JSON menunjukkan berapa banyak trade yang bergantung pada asumsi intraday ambiguity.
 
 Stage 5B adalah BPJS forward paper trading journal. Ini bukan historical backtest akurat tanpa snapshot orderbook historis. Paper trade hanya dibuat untuk Stage 4 mode `bpjs` yang valid dan orderbook `ORDERBOOK_SUPPORTIVE` atau `ORDERBOOK_NEUTRAL`.
 
