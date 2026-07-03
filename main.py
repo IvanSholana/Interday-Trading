@@ -4,7 +4,12 @@ import argparse
 
 from interday_liquidity_screener.cli import run as run_stage_1
 from interday_liquidity_screener.bandarmology import run_stage3b_bandarmology_scoring
+from interday_liquidity_screener.backtest_interday import InterdayBacktestConfig, run_stage5_backtest_interday
+from interday_liquidity_screener.llm_analyst import run_llm_report, run_stage6_build_evidence
+from interday_liquidity_screener.orderbook_filter import OrderbookFilterConfig, run_stage3c_orderbook_filter
+from interday_liquidity_screener.paper_bpjs import BpjsPaperConfig, run_stage5_paper_bpjs, run_stage5_update_bpjs_paper
 from interday_liquidity_screener.stockbit_collector import StockbitCollectorConfig, run_stage3a_broker_collector
+from interday_liquidity_screener.stockbit_collector import parse_windows_arg, run_stage3a_broker_collector_multi_window
 from interday_liquidity_screener.technical import run_stage_2_technical_screening
 from interday_liquidity_screener.trade_plan import TradePlanConfig, run_stage_3_trade_plan, run_stage_4_trade_plan
 
@@ -54,10 +59,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     stage3a = subparsers.add_parser("stage3a", help="Collect Stockbit broker summary for Stage 2 bandar watchlist.")
     stage3a.add_argument("--input", required=True, help="Stage 2 technical context CSV path.")
-    stage3a.add_argument("--output", default="data/output/stage3a_broker_summary_raw.csv")
+    stage3a.add_argument("--output", default=None)
+    stage3a.add_argument("--output-dir", default=None)
     stage3a.add_argument("--raw-dir", default="data/raw_stockbit")
-    stage3a.add_argument("--from-date", required=True)
-    stage3a.add_argument("--to-date", required=True)
+    stage3a.add_argument("--from-date")
+    stage3a.add_argument("--to-date")
+    stage3a.add_argument("--as-of-date")
+    stage3a.add_argument("--windows", default="1D,3D,5D,10D,20D")
     stage3a.add_argument("--limit", type=int, default=25)
     stage3a.add_argument("--sleep-seconds", type=float, default=3.0)
     stage3a.add_argument("--max-retries", type=int, default=3)
@@ -69,25 +77,109 @@ def build_parser() -> argparse.ArgumentParser:
     stage3b.add_argument("--broker-summary", required=True)
     stage3b.add_argument("--output", default="data/output/stage3b_bandarmology_score.csv")
 
+    stage3c = subparsers.add_parser("stage3c", help="Run Stockbit orderbook execution-quality filter.")
+    stage3c.add_argument("--stage2", required=True)
+    stage3c.add_argument("--bandarmology", required=True)
+    stage3c.add_argument("--output", default="data/output/stage3c_orderbook_filter.csv")
+    stage3c.add_argument("--raw-dir", default="data/raw_stockbit_orderbook")
+    stage3c.add_argument("--sleep-seconds", type=float, default=2.0)
+    stage3c.add_argument("--max-retries", type=int, default=3)
+    stage3c.add_argument("--retry-backoff-seconds", type=float, default=10.0)
+
     stage4 = subparsers.add_parser("stage4", help="Run final trade plan with bandarmology confirmation.")
     stage4.add_argument("--stage2", required=True)
     stage4.add_argument("--bandarmology", required=True)
+    stage4.add_argument("--orderbook", default=None)
     stage4.add_argument("--output", default="data/output/stage4_trade_plan.csv")
+    stage4.add_argument("--strategy-mode", choices=["interday", "bpjs"], default="interday")
     stage4.add_argument("--capital", type=float, default=10_000_000)
     stage4.add_argument("--risk-per-trade-pct", type=float, default=0.005)
     stage4.add_argument("--max-risk-per-trade-pct", type=float, default=0.01)
     stage4.add_argument("--max-position-pct", type=float, default=0.20)
-    stage4.add_argument("--tp1-pct", type=float, default=0.05)
-    stage4.add_argument("--tp2-pct", type=float, default=0.08)
-    stage4.add_argument("--max-stop-loss-pct", type=float, default=0.06)
+    stage4.add_argument("--tp1-pct", type=float, default=None)
+    stage4.add_argument("--tp2-pct", type=float, default=None)
+    stage4.add_argument("--max-stop-loss-pct", type=float, default=None)
     stage4.add_argument("--min-rr-tp1", type=float, default=1.2)
     stage4.add_argument("--min-rr-tp2", type=float, default=1.8)
     stage4.add_argument("--rebound-min-rr-tp1", type=float, default=1.3)
     stage4.add_argument("--rebound-min-rr-tp2", type=float, default=2.0)
-    stage4.add_argument("--time-stop-days", type=int, default=10)
+    stage4.add_argument("--time-stop-days", type=int, default=None)
     stage4.add_argument("--lot-size", type=int, default=100)
     stage4.add_argument("--bandarmology-min-score", type=int, default=60)
     stage4.add_argument("--allow-trade-without-broker-data", action="store_true")
+    stage4.add_argument("--require-orderbook-confirmation", action="store_true", default=None)
+    stage4.add_argument("--strict-corporate-action-filter", action="store_true")
+
+    stage5a = subparsers.add_parser("stage5-backtest-interday", help="Backtest valid Stage 4 interday trade plans with daily OHLCV.")
+    stage5a.add_argument("--signals", required=True, help="Stage 4 trade plan CSV path.")
+    stage5a.add_argument("--output", default="data/output/stage5_interday_trades.csv")
+    stage5a.add_argument("--metrics-output", default="data/output/stage5_interday_metrics.json")
+    stage5a.add_argument("--equity-output", default="data/output/stage5_interday_equity_curve.csv")
+    stage5a.add_argument("--price-cache-dir", default="data/cache/ohlcv")
+    stage5a.add_argument("--period", default="1y")
+    stage5a.add_argument("--entry-mode", choices=["next_open", "next_day_entry_zone"], default="next_open")
+    stage5a.add_argument("--time-stop-days", type=int, default=10)
+    stage5a.add_argument("--buy-fee-pct", type=float, default=0.0015)
+    stage5a.add_argument("--sell-fee-pct", type=float, default=0.0025)
+    stage5a.add_argument("--slippage-pct", type=float, default=0.001)
+    stage5a.add_argument("--initial-capital", type=float, default=10_000_000)
+    stage5a.add_argument("--max-entry-gap-pct", type=float, default=0.03)
+    stage5a.add_argument("--allow-entry-gap-too-high", action="store_true")
+    stage5a.add_argument("--refresh-price-cache", action="store_true")
+
+    stage5b = subparsers.add_parser("stage5-paper-bpjs", help="Create BPJS forward paper trading journal from Stage 4.")
+    stage5b.add_argument("--stage4", required=True, help="Stage 4 BPJS trade plan CSV path.")
+    stage5b.add_argument("--orderbook", default=None, help="Stage 3C orderbook CSV path.")
+    stage5b.add_argument("--output", default="data/output/stage5_bpjs_paper_trades.csv")
+    stage5b.add_argument("--summary-output", default=None)
+    stage5b.add_argument("--date", required=True)
+    stage5b.add_argument("--entry-time", default="09:15")
+    stage5b.add_argument("--exit-time", default="15:45")
+    stage5b.add_argument("--lot-size", type=int, default=100)
+
+    stage5_update = subparsers.add_parser("stage5-update-bpjs-paper", help="Update BPJS paper journal with manual actual exits.")
+    stage5_update.add_argument("--paper", required=True, help="Existing BPJS paper trades CSV.")
+    stage5_update.add_argument("--actual-exit", required=True, help="Actual exit CSV with ticker, exit_price, exit_time, exit_reason.")
+    stage5_update.add_argument("--output", default="data/output/stage5_bpjs_paper_trades_updated.csv")
+    stage5_update.add_argument("--summary-output", default=None)
+
+    stage6_evidence = subparsers.add_parser("stage6-build-evidence", help="Build sanitized Stage 6 evidence pack for LLM review.")
+    stage6_evidence.add_argument("--stage2", default=None)
+    stage6_evidence.add_argument("--bandarmology", default=None)
+    stage6_evidence.add_argument("--orderbook", default=None)
+    stage6_evidence.add_argument("--stage4", required=True)
+    stage6_evidence.add_argument("--backtest-metrics", default=None)
+    stage6_evidence.add_argument("--bpjs-summary", default=None)
+    stage6_evidence.add_argument("--output", default="data/output/stage6_evidence_pack.json")
+    stage6_evidence.add_argument("--strategy-mode", choices=["interday", "bpjs"], default="interday")
+    stage6_evidence.add_argument("--run-date", required=True)
+    stage6_evidence.add_argument("--max-candidates", type=int, default=30)
+
+    stage6_report = subparsers.add_parser("stage6-llm-report", help="Generate Stage 6 LLM analyst report from evidence pack.")
+    stage6_report.add_argument("--evidence", required=True)
+    stage6_report.add_argument("--report-output", default="data/output/stage6_llm_daily_report.md")
+    stage6_report.add_argument("--ranking-output", default="data/output/stage6_llm_candidate_ranking.json")
+    stage6_report.add_argument("--watchlist-output", default="data/output/stage6_llm_watchlist_notes.csv")
+    stage6_report.add_argument("--raw-output", default="data/output/stage6_llm_raw_response.json")
+    stage6_report.add_argument("--strategy-mode", choices=["interday", "bpjs"], default="interday")
+    stage6_report.add_argument("--dry-run", action="store_true")
+
+    stage6 = subparsers.add_parser("stage6", help="Build Stage 6 evidence and generate LLM analyst report.")
+    stage6.add_argument("--stage2", default=None)
+    stage6.add_argument("--bandarmology", default=None)
+    stage6.add_argument("--orderbook", default=None)
+    stage6.add_argument("--stage4", required=True)
+    stage6.add_argument("--backtest-metrics", default=None)
+    stage6.add_argument("--bpjs-summary", default=None)
+    stage6.add_argument("--evidence-output", default="data/output/stage6_evidence_pack.json")
+    stage6.add_argument("--report-output", default="data/output/stage6_llm_daily_report.md")
+    stage6.add_argument("--ranking-output", default="data/output/stage6_llm_candidate_ranking.json")
+    stage6.add_argument("--watchlist-output", default="data/output/stage6_llm_watchlist_notes.csv")
+    stage6.add_argument("--raw-output", default="data/output/stage6_llm_raw_response.json")
+    stage6.add_argument("--strategy-mode", choices=["interday", "bpjs"], default="interday")
+    stage6.add_argument("--run-date", required=True)
+    stage6.add_argument("--max-candidates", type=int, default=30)
+    stage6.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -121,11 +213,29 @@ def main() -> None:
             max_retries=args.max_retries,
             retry_backoff_seconds=args.retry_backoff_seconds,
         )
-        run_stage3a_broker_collector(args.input, args.output, args.raw_dir, args.from_date, args.to_date, config)
+        if args.as_of_date:
+            if args.from_date or args.to_date:
+                raise SystemExit("Use either --as-of-date/--windows or --from-date/--to-date, not both.")
+            output_dir = args.output_dir or "data/output/stockbit"
+            windows = parse_windows_arg(args.windows)
+            run_stage3a_broker_collector_multi_window(args.input, output_dir, args.raw_dir, args.as_of_date, windows, config)
+        else:
+            if not args.from_date or not args.to_date:
+                raise SystemExit("Single-window mode requires --from-date and --to-date. Multi-window mode requires --as-of-date.")
+            output = args.output or "data/output/stage3a_broker_summary_long.csv"
+            run_stage3a_broker_collector(args.input, output, args.raw_dir, args.from_date, args.to_date, config)
     elif args.command == "stage3b":
         run_stage3b_bandarmology_scoring(args.stage2, args.detector_summary, args.broker_summary, args.output)
+    elif args.command == "stage3c":
+        config = OrderbookFilterConfig(
+            sleep_seconds=args.sleep_seconds,
+            max_retries=args.max_retries,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+        )
+        run_stage3c_orderbook_filter(args.stage2, args.bandarmology, args.output, args.raw_dir, config)
     elif args.command == "stage4":
         config = TradePlanConfig(
+            strategy_mode=args.strategy_mode,
             capital=args.capital,
             risk_per_trade_pct=args.risk_per_trade_pct,
             max_risk_per_trade_pct=args.max_risk_per_trade_pct,
@@ -141,8 +251,64 @@ def main() -> None:
             lot_size=args.lot_size,
             bandarmology_min_score=args.bandarmology_min_score,
             allow_trade_without_broker_data=args.allow_trade_without_broker_data,
+            require_orderbook_confirmation=args.require_orderbook_confirmation,
+            strict_corporate_action_filter=args.strict_corporate_action_filter,
         )
-        run_stage_4_trade_plan(args.stage2, args.bandarmology, args.output, config=config)
+        run_stage_4_trade_plan(args.stage2, args.bandarmology, args.output, config=config, orderbook_path=args.orderbook)
+    elif args.command == "stage5-backtest-interday":
+        config = InterdayBacktestConfig(
+            price_cache_dir=args.price_cache_dir,
+            period=args.period,
+            entry_mode=args.entry_mode,
+            time_stop_days=args.time_stop_days,
+            buy_fee_pct=args.buy_fee_pct,
+            sell_fee_pct=args.sell_fee_pct,
+            slippage_pct=args.slippage_pct,
+            initial_capital=args.initial_capital,
+            max_entry_gap_pct=args.max_entry_gap_pct,
+            reject_if_entry_gap_too_high=not args.allow_entry_gap_too_high,
+            refresh_price_cache=args.refresh_price_cache,
+        )
+        run_stage5_backtest_interday(args.signals, args.output, args.metrics_output, args.equity_output, config)
+    elif args.command == "stage5-paper-bpjs":
+        config = BpjsPaperConfig(
+            date=args.date,
+            entry_time=args.entry_time,
+            exit_time=args.exit_time,
+            lot_size=args.lot_size,
+        )
+        run_stage5_paper_bpjs(args.stage4, args.orderbook, args.output, config, summary_output_path=args.summary_output)
+    elif args.command == "stage5-update-bpjs-paper":
+        run_stage5_update_bpjs_paper(args.paper, args.actual_exit, args.output, summary_output_path=args.summary_output)
+    elif args.command == "stage6-build-evidence":
+        run_stage6_build_evidence(
+            args.stage2,
+            args.bandarmology,
+            args.orderbook,
+            args.stage4,
+            args.backtest_metrics,
+            args.bpjs_summary,
+            args.output,
+            args.strategy_mode,
+            args.run_date,
+            args.max_candidates,
+        )
+    elif args.command == "stage6-llm-report":
+        run_llm_report(args.evidence, args.report_output, args.ranking_output, args.watchlist_output, args.raw_output, args.strategy_mode, dry_run=args.dry_run)
+    elif args.command == "stage6":
+        run_stage6_build_evidence(
+            args.stage2,
+            args.bandarmology,
+            args.orderbook,
+            args.stage4,
+            args.backtest_metrics,
+            args.bpjs_summary,
+            args.evidence_output,
+            args.strategy_mode,
+            args.run_date,
+            args.max_candidates,
+        )
+        run_llm_report(args.evidence_output, args.report_output, args.ranking_output, args.watchlist_output, args.raw_output, args.strategy_mode, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

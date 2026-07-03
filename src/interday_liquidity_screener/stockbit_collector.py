@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,14 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
+
+BANDAR_WINDOWS = {
+    "1D": 1,
+    "3D": 3,
+    "5D": 5,
+    "10D": 10,
+    "20D": 20,
+}
 
 
 @dataclass(frozen=True)
@@ -43,6 +52,90 @@ def parse_number(value: Any) -> float | None:
         return float(text) * multiplier
     except ValueError:
         return None
+
+
+def parse_windows_arg(windows: str) -> dict[str, int]:
+    if not windows or not str(windows).strip():
+        raise ValueError("--windows cannot be empty")
+    parsed: dict[str, int] = {}
+    for raw_label in str(windows).split(","):
+        label = raw_label.strip().upper()
+        if not label:
+            continue
+        if label in {"1", "3", "5", "10", "20"}:
+            label = f"{label}D"
+        if label not in BANDAR_WINDOWS:
+            raise ValueError(f"Unsupported bandar window: {label}. Supported: {', '.join(BANDAR_WINDOWS)}")
+        parsed[label] = BANDAR_WINDOWS[label]
+    if not parsed:
+        raise ValueError("--windows did not contain any valid window label")
+    return parsed
+
+
+def _parse_date(value: str | date) -> date:
+    if isinstance(value, date):
+        return value
+    return datetime.strptime(str(value), "%Y-%m-%d").date()
+
+
+def _stage2_trading_dates(input_path: str | Path) -> list[str]:
+    path = Path(input_path)
+    if not path.exists():
+        return []
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return []
+    if "last_date" not in df.columns:
+        return []
+    dates = sorted({str(value)[:10] for value in df["last_date"].dropna() if str(value)[:10]})
+    return [value for value in dates if len(value) == 10]
+
+
+def resolve_window_dates(
+    as_of_date: str | date,
+    window_label: str,
+    window_days: int,
+    trading_dates: list[str] | None = None,
+) -> tuple[str, str]:
+    to_dt = _parse_date(as_of_date)
+    to_date = to_dt.isoformat()
+    if window_days <= 1:
+        return to_date, to_date
+
+    if trading_dates:
+        eligible = sorted(date_value for date_value in trading_dates if date_value <= to_date)
+        if eligible:
+            if to_date not in eligible:
+                eligible.append(to_date)
+                eligible = sorted(set(eligible))
+            end_index = eligible.index(to_date)
+            start_index = max(0, end_index - window_days + 1)
+            return eligible[start_index], to_date
+
+    calendar_buffer = max(window_days - 1, 0)
+    from_dt = to_dt - timedelta(days=calendar_buffer)
+    print(f"Warning: using calendar-day fallback for {window_label}; trading dates were not available.")
+    return from_dt.isoformat(), to_date
+
+
+def build_bandar_windows(
+    as_of_date: str | date,
+    windows_config: dict[str, int],
+    trading_dates: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for label, days in windows_config.items():
+        from_date, to_date = resolve_window_dates(as_of_date, label, days, trading_dates=trading_dates)
+        rows.append(
+            {
+                "window_label": label,
+                "window_days": days,
+                "from_date": from_date,
+                "to_date": to_date,
+            }
+        )
+    return rows
 
 
 def _load_dotenv(path: str | Path = ".env") -> None:
@@ -136,10 +229,18 @@ def fetch_marketdetector(
     raise RuntimeError(f"Failed to fetch Stockbit marketdetector for {ticker}: {last_error}")
 
 
-def save_raw_json(payload: dict[str, Any], ticker: str, from_date: str, to_date: str, raw_dir: str | Path) -> Path:
+def save_raw_json(
+    payload: dict[str, Any],
+    ticker: str,
+    from_date: str,
+    to_date: str,
+    raw_dir: str | Path,
+    window_label: str | None = None,
+) -> Path:
     path = Path(raw_dir)
     path.mkdir(parents=True, exist_ok=True)
-    file_path = path / f"{ticker}_{from_date}_{to_date}.json"
+    suffix = f"{window_label}_{from_date}_{to_date}" if window_label else f"{from_date}_{to_date}"
+    file_path = path / f"{ticker}_{suffix}.json"
     file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return file_path
 
@@ -159,11 +260,15 @@ def normalize_bandar_detector_summary(
     ticker: str,
     from_date: str,
     to_date: str,
+    window_label: str = "CUSTOM",
+    window_days: int | None = None,
 ) -> dict[str, Any]:
     detector = _response_data(payload).get("bandar_detector", {})
     detector = detector if isinstance(detector, dict) else {}
     row: dict[str, Any] = {
         "ticker": ticker,
+        "window_label": window_label,
+        "window_days": window_days,
         "from_date": from_date,
         "to_date": to_date,
         "detector_average_price": parse_number(detector.get("average")),
@@ -190,6 +295,8 @@ def normalize_broker_summary_long(
     ticker: str,
     from_date: str,
     to_date: str,
+    window_label: str = "CUSTOM",
+    window_days: int | None = None,
 ) -> list[dict[str, Any]]:
     broker_summary = _response_data(payload).get("broker_summary", {})
     broker_summary = broker_summary if isinstance(broker_summary, dict) else {}
@@ -215,6 +322,8 @@ def normalize_broker_summary_long(
             rows.append(
                 {
                     "ticker": ticker,
+                    "window_label": window_label,
+                    "window_days": window_days,
                     "from_date": from_date,
                     "to_date": to_date,
                     "side": side,
@@ -234,6 +343,8 @@ def normalize_broker_summary_long(
         rows.append(
             {
                 "ticker": ticker,
+                "window_label": window_label,
+                "window_days": window_days,
                 "from_date": from_date,
                 "to_date": to_date,
                 "raw_item_json": json.dumps(broker_summary, ensure_ascii=False),
@@ -337,8 +448,8 @@ def run_stage3a_broker_collector(
         try:
             payload = fetch_marketdetector(ticker, from_date, to_date, config, token=token)
             save_raw_json(payload, ticker, from_date, to_date, raw_dir)
-            detector_rows.append(normalize_bandar_detector_summary(payload, ticker, from_date, to_date))
-            broker_rows.extend(normalize_broker_summary_long(payload, ticker, from_date, to_date))
+            detector_rows.append(normalize_bandar_detector_summary(payload, ticker, from_date, to_date, "CUSTOM", None))
+            broker_rows.extend(normalize_broker_summary_long(payload, ticker, from_date, to_date, "CUSTOM", None))
             success += 1
         except RuntimeError as exc:
             failed += 1
@@ -373,3 +484,76 @@ def run_stage3a_broker_collector(
     print(f"Bandar detector summary path: {detector_path}")
     print(f"Raw dir path: {raw_dir}")
     return broker_output
+
+
+def run_stage3a_broker_collector_multi_window(
+    input_path: str | Path,
+    output_dir: str | Path,
+    raw_dir: str | Path,
+    as_of_date: str,
+    windows_config: dict[str, int],
+    config: StockbitCollectorConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    watchlist = load_stage2_bandar_watchlist(input_path)
+    trading_dates = _stage2_trading_dates(input_path)
+    window_rows = build_bandar_windows(as_of_date, windows_config, trading_dates=trading_dates)
+    token = get_stockbit_token()
+    planned_calls = len(watchlist) * len(window_rows)
+    print(f"Stage 3A watchlist tickers: {len(watchlist)}")
+    print(f"Windows requested: {', '.join(row['window_label'] for row in window_rows)}")
+    print(f"Total API calls planned: {planned_calls}")
+
+    detector_rows: list[dict[str, Any]] = []
+    broker_rows: list[dict[str, Any]] = []
+    success = failed = unauthorized = rate_limited = 0
+    for _, row in watchlist.iterrows():
+        ticker = str(row["ticker"]).replace(".JK", "")
+        for window in window_rows:
+            window_label = str(window["window_label"])
+            window_days = int(window["window_days"])
+            from_date = str(window["from_date"])
+            to_date = str(window["to_date"])
+            try:
+                payload = fetch_marketdetector(ticker, from_date, to_date, config, token=token)
+                save_raw_json(payload, ticker, from_date, to_date, raw_dir, window_label=window_label)
+                detector_rows.append(
+                    normalize_bandar_detector_summary(payload, ticker, from_date, to_date, window_label, window_days)
+                )
+                broker_rows.extend(
+                    normalize_broker_summary_long(payload, ticker, from_date, to_date, window_label, window_days)
+                )
+                success += 1
+            except RuntimeError as exc:
+                failed += 1
+                if "expired/invalid" in str(exc):
+                    unauthorized += 1
+                print(f"{ticker} {window_label}: {exc}")
+            except HTTPError as exc:
+                failed += 1
+                if exc.code == 401:
+                    unauthorized += 1
+                if exc.code == 429:
+                    rate_limited += 1
+                print(f"{ticker} {window_label}: HTTP {exc.code}")
+            except Exception as exc:
+                failed += 1
+                print(f"{ticker} {window_label}: fetch_failed {exc}")
+            time.sleep(config.sleep_seconds)
+
+    output_base = Path(output_dir)
+    output_base.mkdir(parents=True, exist_ok=True)
+    detector_path = output_base / "stage3a_bandar_detector_summary.csv"
+    broker_path = output_base / "stage3a_broker_summary_long.csv"
+    detector_output = pd.DataFrame(detector_rows)
+    broker_output = pd.DataFrame(broker_rows)
+    detector_output.to_csv(detector_path, index=False)
+    broker_output.to_csv(broker_path, index=False)
+
+    print(f"Fetched success: {success}")
+    print(f"Failed: {failed}")
+    print(f"401 count: {unauthorized}")
+    print(f"429 count: {rate_limited}")
+    print(f"Bandar detector summary path: {detector_path}")
+    print(f"Broker summary output path: {broker_path}")
+    print(f"Raw dir path: {raw_dir}")
+    return detector_output, broker_output

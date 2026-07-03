@@ -166,6 +166,81 @@ def fetch_ohlcv_history(yahoo_ticker: str, period: str = "1y") -> pd.DataFrame:
     return data
 
 
+def _normalize_ohlcv_df(data: pd.DataFrame, ticker: str | None = None) -> pd.DataFrame:
+    """Normalize a single-ticker OHLCV DataFrame to standard column names."""
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    if isinstance(data.columns, pd.MultiIndex):
+        if ticker and ticker in data.columns.get_level_values(-1):
+            data = data.xs(ticker, axis=1, level=-1)
+        elif ticker and ticker in data.columns.get_level_values(0):
+            data = data.xs(ticker, axis=1, level=0)
+        else:
+            data.columns = data.columns.get_level_values(0)
+
+    rename_map = {
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Adj Close": "adjusted_close",
+        "Volume": "volume",
+    }
+    data = data.rename(columns=rename_map)
+    columns = [column for column in ["open", "high", "low", "close", "adjusted_close", "volume"] if column in data.columns]
+    if not columns:
+        return pd.DataFrame()
+    data = data[columns].copy()
+    data.index.name = "date"
+    return data
+
+
+def _batch_fetch_ohlcv(tickers: list[str], period: str = "1y", batch_size: int = 50) -> dict[str, pd.DataFrame]:
+    """Batch download OHLCV for multiple tickers efficiently using yfinance multi-ticker mode."""
+    import yfinance as yf
+
+    results: dict[str, pd.DataFrame] = {}
+    if not tickers:
+        return results
+
+    batches = [tickers[i : i + batch_size] for i in range(0, len(tickers), batch_size)]
+    for batch_idx, batch in enumerate(batches, start=1):
+        print(f"Stage 2 downloading batch {batch_idx}/{len(batches)}: {len(batch)} tickers")
+        try:
+            data = yf.download(
+                tickers=batch,
+                period=period,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+            )
+            if data is None or data.empty:
+                for ticker in batch:
+                    results[ticker] = pd.DataFrame()
+                continue
+
+            if len(batch) == 1:
+                results[batch[0]] = _normalize_ohlcv_df(data, batch[0])
+            else:
+                top_level = set(data.columns.get_level_values(0))
+                for ticker in batch:
+                    if ticker in top_level:
+                        ticker_data = data[ticker].copy()
+                        ticker_data.columns = [str(c) for c in ticker_data.columns]
+                        results[ticker] = _normalize_ohlcv_df(ticker_data)
+                    else:
+                        results[ticker] = pd.DataFrame()
+        except Exception as exc:
+            print(f"Batch {batch_idx} download error: {exc}")
+            for ticker in batch:
+                results[ticker] = pd.DataFrame()
+
+    return results
+
+
 def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -309,26 +384,28 @@ def classify_relative_activity(row: dict[str, Any] | pd.Series) -> str:
     return "QUIET"
 
 
+_CORE_DATA_FIELDS = frozenset({
+    "close",
+    "value_est",
+    "ma20",
+    "ma50",
+    "rsi14",
+    "atr_pct",
+    "volume_ratio",
+    "value_ratio",
+    "return_1d",
+    "high_20d",
+    "low_20d",
+    "distance_from_20d_low",
+    "close_location",
+    "trend_score",
+    "momentum_score",
+    "volatility_score",
+})
+
+
 def _has_invalid_core_data(row: dict[str, Any] | pd.Series) -> bool:
-    required = [
-        "close",
-        "value_est",
-        "ma20",
-        "ma50",
-        "rsi14",
-        "atr_pct",
-        "volume_ratio",
-        "value_ratio",
-        "return_1d",
-        "high_20d",
-        "low_20d",
-        "distance_from_20d_low",
-        "close_location",
-        "trend_score",
-        "momentum_score",
-        "volatility_score",
-    ]
-    return any(row.get(column) is None or pd.isna(row.get(column)) for column in required)
+    return any(row.get(column) is None or pd.isna(row.get(column)) for column in _CORE_DATA_FIELDS)
 
 
 def classify_entry_setup(row: dict[str, Any] | pd.Series) -> str:
@@ -694,17 +771,17 @@ def run_stage_2_technical_screening(
 
     results: list[dict[str, Any]] = []
     failed_downloads = 0
+
+    # Batch download all tickers at once for efficiency
+    yahoo_tickers = candidates["yahoo_ticker"].tolist()
+    histories: dict[str, pd.DataFrame] = _batch_fetch_ohlcv(yahoo_tickers, period)
+
     for _, candidate in candidates.iterrows():
         yahoo_ticker = candidate["yahoo_ticker"]
-        try:
-            history = fetch_ohlcv_history(yahoo_ticker, period=period)
-            if history.empty:
-                failed_downloads += 1
-            results.append(build_latest_technical_row(candidate, history))
-        except Exception as exc:
+        history = histories.get(yahoo_ticker, pd.DataFrame())
+        if history.empty:
             failed_downloads += 1
-            invalid = _invalid_result(candidate, f"invalid_data_error_{exc}")
-            results.append(invalid)
+        results.append(build_latest_technical_row(candidate, history))
 
     output = build_technical_output_frame(results)
     path = Path(output_path)

@@ -14,6 +14,15 @@ ACTIONABLE_SETUPS = {
     "REBOUND_CANDIDATE",
 }
 
+ACTIVE_TECHNICAL_CONTEXTS = {
+    "BREAKOUT_NEAR",
+    "REBOUND_NEAR_LOW",
+    "PULLBACK_TO_MA",
+    "UPTREND_CONTINUATION",
+    "VOLUME_SPIKE",
+    "EARLY_REVERSAL_ATTEMPT",
+}
+
 IDX_TICK_TABLE = [
     {"min_price": 0, "max_price": 200, "tick": 1},
     {"min_price": 200, "max_price": 500, "tick": 2},
@@ -26,8 +35,13 @@ TRADE_STATUSES = [
     "VALID_TRADE_PLAN",
     "SKIPPED_NOT_TRADE_CANDIDATE",
     "SKIPPED_NO_BROKER_DATA",
+    "SKIPPED_NO_ORDERBOOK_DATA",
     "SKIPPED_LOW_BANDARMOLOGY_SCORE",
     "SKIPPED_NO_BANDAR_CONFIRMATION",
+    "WATCH_BANDAR_ACCUMULATION_WAIT_TECHNICAL_TRIGGER",
+    "WATCH_SHORT_TERM_ACCUMULATION_AGAINST_DISTRIBUTION",
+    "WATCH_PULLBACK_WITH_MEDIUM_ACCUMULATION",
+    "WATCH_CORPORATE_ACTION_RISK",
     "INVALID_DATA",
     "WAIT_FOR_VOLUME_CONFIRMATION",
     "WAIT_FOR_REBOUND_CONFIRMATION",
@@ -40,6 +54,13 @@ TRADE_STATUSES = [
     "REJECT_BAD_RISK_REWARD_TP2",
     "REJECT_TOO_VOLATILE",
     "REJECT_POSITION_TOO_SMALL",
+    "REJECT_NOT_TRADABLE",
+    "REJECT_UMA_OR_NOTATION_RISK",
+    "REJECT_CORPORATE_ACTION_RISK",
+    "WAIT_ORDERBOOK_SPREAD_TOO_WIDE",
+    "WAIT_ORDERBOOK_OFFER_WALL",
+    "WAIT_ORDERBOOK_BID_DEPTH_WEAK",
+    "WAIT_ORDERBOOK_NEAR_ARA_ARB",
 ]
 
 PLAN_NUMERIC_COLUMNS = [
@@ -119,6 +140,8 @@ STAGE3_OUTPUT_COLUMNS = [
     "theoretical_max_loss_amount",
     "executable_max_loss_amount",
     "time_stop_days",
+    "strategy_mode",
+    "force_exit_same_day",
     "liquidity_bucket",
     "relative_activity_bucket",
     "technical_context",
@@ -128,6 +151,24 @@ STAGE3_OUTPUT_COLUMNS = [
     "bandarmology_reason",
     "bandarmology_summary",
     "broker_activity_available",
+    "orderbook_status",
+    "orderbook_score",
+    "spread_pct",
+    "depth_imbalance_top5",
+    "offer_wall_ratio_top5",
+    "bid_volume_top5",
+    "offer_volume_top5",
+    "fnet",
+    "foreign_net_ratio",
+    "tradable",
+    "uma",
+    "notation",
+    "notation_risky",
+    "corp_action",
+    "corp_action_active",
+    "near_ara",
+    "near_arb",
+    "execution_quality_note",
     "volume",
     "value_est",
     "avg_volume_20d",
@@ -167,17 +208,49 @@ class TradePlanConfig:
     risk_per_trade_pct: float = 0.005
     max_risk_per_trade_pct: float = 0.01
     max_position_pct: float = 0.20
-    tp1_pct: float = 0.05
-    tp2_pct: float = 0.08
-    max_stop_loss_pct: float = 0.06
+    tp1_pct: float | None = None
+    tp2_pct: float | None = None
+    max_stop_loss_pct: float | None = None
     min_rr_tp1: float = 1.2
     min_rr_tp2: float = 1.8
     rebound_min_rr_tp1: float = 1.3
     rebound_min_rr_tp2: float = 2.0
-    time_stop_days: int = 10
+    time_stop_days: int | None = None
     lot_size: int = 100
     bandarmology_min_score: int = 60
     allow_trade_without_broker_data: bool = False
+    require_orderbook_confirmation: bool | None = None
+    strategy_mode: str = "interday"
+    force_exit_same_day: bool | None = None
+    strict_corporate_action_filter: bool = False
+
+    def __post_init__(self) -> None:
+        mode = str(self.strategy_mode or "interday").lower()
+        if mode not in {"interday", "bpjs"}:
+            raise ValueError("strategy_mode must be either 'interday' or 'bpjs'")
+        object.__setattr__(self, "strategy_mode", mode)
+
+        defaults = {
+            "interday": {
+                "tp1_pct": 0.05,
+                "tp2_pct": 0.08,
+                "max_stop_loss_pct": 0.06,
+                "time_stop_days": 10,
+                "require_orderbook_confirmation": False,
+                "force_exit_same_day": False,
+            },
+            "bpjs": {
+                "tp1_pct": 0.02,
+                "tp2_pct": 0.03,
+                "max_stop_loss_pct": 0.015,
+                "time_stop_days": 0,
+                "require_orderbook_confirmation": True,
+                "force_exit_same_day": True,
+            },
+        }[mode]
+        for field_name, default_value in defaults.items():
+            if getattr(self, field_name) is None:
+                object.__setattr__(self, field_name, default_value)
 
     @property
     def risk_amount(self) -> float:
@@ -202,6 +275,10 @@ def _bool_value(value: Any) -> bool:
 
 def _has_bandarmology_context(row: dict[str, Any] | pd.Series) -> bool:
     return any(key in row for key in ["bandarmology_signal", "bandarmology_score", "broker_activity_available"])
+
+
+def _has_orderbook_context(row: dict[str, Any] | pd.Series) -> bool:
+    return any(key in row for key in ["orderbook_status", "orderbook_score"])
 
 
 def _nan_plan_fields(result: dict[str, Any]) -> None:
@@ -343,8 +420,6 @@ def _plan_setup(row: dict[str, Any] | pd.Series) -> str:
         return "REBOUND_CANDIDATE"
     if context in {"VOLUME_SPIKE", "SIDEWAYS_COMPRESSION"}:
         return "WATCH_ENTRY"
-    if _has_bandarmology_context(row) and context not in {"INVALID_DATA", "TOO_VOLATILE", "TOO_QUIET_ABSOLUTE"}:
-        return "WATCH_ENTRY"
     return "NO_TRADE"
 
 
@@ -478,6 +553,10 @@ def _status_reason_summary(status: str) -> tuple[str, str]:
             "skipped_because_no_broker_summary_data_available",
             "Skipped because no broker summary data is available and broker confirmation is required.",
         ),
+        "SKIPPED_NO_ORDERBOOK_DATA": (
+            "skipped_because_no_orderbook_data_available",
+            "Skipped because orderbook confirmation is required but no orderbook data is available.",
+        ),
         "SKIPPED_LOW_BANDARMOLOGY_SCORE": (
             "skipped_because_bandarmology_score_below_threshold",
             "Skipped because bandarmology score is below the configured threshold.",
@@ -485,6 +564,22 @@ def _status_reason_summary(status: str) -> tuple[str, str]:
         "SKIPPED_NO_BANDAR_CONFIRMATION": (
             "skipped_because_broker_flow_does_not_confirm_accumulation",
             "Skipped because broker flow does not show accumulation confirmation.",
+        ),
+        "WATCH_BANDAR_ACCUMULATION_WAIT_TECHNICAL_TRIGGER": (
+            "watching_bandar_accumulation_but_waiting_for_technical_trigger",
+            "Broker flow shows accumulation, but technical context is still weak. Wait for a cleaner technical trigger before building an executable trade plan.",
+        ),
+        "WATCH_SHORT_TERM_ACCUMULATION_AGAINST_DISTRIBUTION": (
+            "short_term_accumulation_against_medium_distribution",
+            "Short-term broker flow improves, but medium-window distribution is still dominant. Keep on watchlist, do not execute by default.",
+        ),
+        "WATCH_PULLBACK_WITH_MEDIUM_ACCUMULATION": (
+            "pullback_inside_medium_term_accumulation",
+            "Short-term selling appears inside a medium-term accumulation structure. Watch for reversal confirmation before execution.",
+        ),
+        "WATCH_CORPORATE_ACTION_RISK": (
+            "watching_because_corporate_action_risk_is_active",
+            "Corporate action risk is active. Keep this ticker on watchlist and avoid building an executable trade plan by default.",
         ),
         "INVALID_DATA": (
             "invalid_data_from_stage2",
@@ -533,6 +628,34 @@ def _status_reason_summary(status: str) -> tuple[str, str]:
         "REJECT_POSITION_TOO_SMALL": (
             "rejected_because_position_size_is_too_small",
             "Trade plan is rejected because the configured capital and risk limit cannot buy at least one lot.",
+        ),
+        "REJECT_NOT_TRADABLE": (
+            "rejected_because_stock_is_not_tradable",
+            "Orderbook says the stock is not tradable now. Do not execute.",
+        ),
+        "REJECT_UMA_OR_NOTATION_RISK": (
+            "rejected_because_uma_or_special_notation_risk",
+            "Orderbook has UMA or special notation risk. Do not execute by default.",
+        ),
+        "REJECT_CORPORATE_ACTION_RISK": (
+            "rejected_because_corporate_action_risk",
+            "Corporate action risk is present. Do not execute by default.",
+        ),
+        "WAIT_ORDERBOOK_SPREAD_TOO_WIDE": (
+            "waiting_because_orderbook_spread_is_too_wide",
+            "Orderbook spread is too wide for clean execution. Wait for a tighter spread.",
+        ),
+        "WAIT_ORDERBOOK_OFFER_WALL": (
+            "waiting_because_orderbook_offer_wall_is_heavy",
+            "Offer wall is heavy near the top of book. Wait for supply to thin before execution.",
+        ),
+        "WAIT_ORDERBOOK_BID_DEPTH_WEAK": (
+            "waiting_because_orderbook_bid_depth_is_weak",
+            "Bid depth is weak versus offer depth. Wait for stronger support before execution.",
+        ),
+        "WAIT_ORDERBOOK_NEAR_ARA_ARB": (
+            "waiting_because_price_is_near_auto_reject_band",
+            "Price is too close to ARA/ARB. Avoid chasing execution around auto-reject bands.",
         ),
     }
     return mapping[status]
@@ -587,6 +710,59 @@ def recalculate_plan_after_rounding(
     return plan
 
 
+def build_execution_quality_note(row: dict[str, Any] | pd.Series, config: TradePlanConfig) -> str:
+    if not _has_orderbook_context(row):
+        return "No orderbook snapshot was provided."
+    status = row.get("orderbook_status")
+    score = row.get("orderbook_score")
+    spread_pct = row.get("spread_pct")
+    imbalance = row.get("depth_imbalance_top5")
+    parts = [f"Orderbook status: {status or 'UNKNOWN'}"]
+    if score is not None and pd.notna(score):
+        parts.append(f"score={float(score):.0f}")
+    if spread_pct is not None and pd.notna(spread_pct):
+        parts.append(f"spread_pct={float(spread_pct):.4f}")
+    if imbalance is not None and pd.notna(imbalance):
+        parts.append(f"depth_imbalance_top5={float(imbalance):.2f}")
+    if _bool_value(row.get("corp_action_active")):
+        parts.append("corporate_action_active=True")
+    if _bool_value(row.get("notation_risky")):
+        parts.append("notation_risky=True")
+    parts.append(f"strategy_mode={config.strategy_mode}")
+    return "; ".join(parts)
+
+
+def _orderbook_trade_status(row: dict[str, Any] | pd.Series, config: TradePlanConfig) -> str | None:
+    corp_action_active = _bool_value(row.get("corp_action_active"))
+    if config.strategy_mode == "interday":
+        if corp_action_active and config.strict_corporate_action_filter:
+            return "REJECT_CORPORATE_ACTION_RISK"
+        if corp_action_active:
+            return "WATCH_CORPORATE_ACTION_RISK"
+        if not config.require_orderbook_confirmation:
+            return None
+    if config.strategy_mode == "bpjs" and corp_action_active:
+        return "REJECT_CORPORATE_ACTION_RISK"
+    if not config.require_orderbook_confirmation:
+        return None
+    status = row.get("orderbook_status")
+    if status is None or pd.isna(status) or status == "":
+        return "SKIPPED_NO_ORDERBOOK_DATA"
+    mapping = {
+        "NO_ORDERBOOK_DATA": "SKIPPED_NO_ORDERBOOK_DATA",
+        "REJECT_NOT_TRADABLE": "REJECT_NOT_TRADABLE",
+        "REJECT_UMA_OR_NOTATION_RISK": "REJECT_UMA_OR_NOTATION_RISK",
+        "REJECT_CORPORATE_ACTION_RISK": "REJECT_CORPORATE_ACTION_RISK",
+        "WAIT_SPREAD_TOO_WIDE": "WAIT_ORDERBOOK_SPREAD_TOO_WIDE",
+        "WAIT_OFFER_WALL": "WAIT_ORDERBOOK_OFFER_WALL",
+        "WAIT_BID_DEPTH_WEAK": "WAIT_ORDERBOOK_BID_DEPTH_WEAK",
+        "WAIT_NEAR_ARA_ARB": "WAIT_ORDERBOOK_NEAR_ARA_ARB",
+    }
+    if status in {"ORDERBOOK_SUPPORTIVE", "ORDERBOOK_NEUTRAL"}:
+        return None
+    return mapping.get(str(status), "SKIPPED_NO_ORDERBOOK_DATA")
+
+
 def validate_pre_plan_gate(result: dict[str, Any], config: TradePlanConfig) -> str | None:
     if not _bool_value(result.get("is_data_valid")):
         return "INVALID_DATA"
@@ -610,10 +786,25 @@ def validate_pre_plan_gate(result: dict[str, Any], config: TradePlanConfig) -> s
         score = _value(result, "bandarmology_score")
         if (not broker_available or signal == "NO_BROKER_DATA") and not config.allow_trade_without_broker_data:
             return "SKIPPED_NO_BROKER_DATA"
+        if broker_available and signal in {"STRONG_DISTRIBUTION", "MILD_DISTRIBUTION"}:
+            return "SKIPPED_NO_BANDAR_CONFIRMATION"
+        if broker_available and signal == "SHORT_TERM_ACCUMULATION_AGAINST_MEDIUM_DISTRIBUTION":
+            return "WATCH_SHORT_TERM_ACCUMULATION_AGAINST_DISTRIBUTION"
+        if broker_available and signal == "PULLBACK_WITH_MEDIUM_ACCUMULATION":
+            return "WATCH_PULLBACK_WITH_MEDIUM_ACCUMULATION"
+        if broker_available and signal == "NEUTRAL_FLOW":
+            return "SKIPPED_LOW_BANDARMOLOGY_SCORE"
         if broker_available and score < config.bandarmology_min_score:
             return "SKIPPED_LOW_BANDARMOLOGY_SCORE"
         if broker_available and signal not in {"STRONG_ACCUMULATION", "MILD_ACCUMULATION"}:
             return "SKIPPED_NO_BANDAR_CONFIRMATION"
+        if technical_context == "TECHNICALLY_WEAK_BUT_LIQUID":
+            return "WATCH_BANDAR_ACCUMULATION_WAIT_TECHNICAL_TRIGGER"
+        if technical_context not in ACTIVE_TECHNICAL_CONTEXTS:
+            return "SKIPPED_NOT_TRADE_CANDIDATE"
+        orderbook_status = _orderbook_trade_status(result, config)
+        if orderbook_status is not None:
+            return orderbook_status
     else:
         setup = result.get("entry_setup")
         if setup not in ACTIONABLE_SETUPS:
@@ -689,12 +880,50 @@ def _merge_stage2_bandarmology(stage2_path: str | Path, bandarmology_path: str |
     return stage2.merge(bandar[bandar_columns], on="ticker", how="left")
 
 
+def _merge_orderbook(candidates: pd.DataFrame, orderbook_path: str | Path | None) -> pd.DataFrame:
+    if not orderbook_path:
+        return candidates
+    path = Path(orderbook_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Stage 3C orderbook file not found: {path}")
+    orderbook = pd.read_csv(path)
+    keep = [
+        column
+        for column in orderbook.columns
+        if column == "ticker"
+        or column
+        in {
+            "orderbook_status",
+            "orderbook_score",
+            "spread_pct",
+            "depth_imbalance_top5",
+            "offer_wall_ratio_top5",
+            "bid_volume_top5",
+            "offer_volume_top5",
+            "fnet",
+            "foreign_net_ratio",
+            "tradable",
+            "uma",
+            "notation",
+            "notation_risky",
+            "corp_action",
+            "corp_action_active",
+            "near_ara",
+            "near_arb",
+        }
+    ]
+    return candidates.merge(orderbook[keep], on="ticker", how="left")
+
+
 def build_trade_plan_row(row: dict[str, Any] | pd.Series, config: TradePlanConfig) -> dict[str, Any]:
     result = row.to_dict() if isinstance(row, pd.Series) else dict(row)
     result["capital"] = config.capital
     result["risk_per_trade_pct"] = min(config.risk_per_trade_pct, config.max_risk_per_trade_pct)
     result["risk_amount"] = config.risk_amount
     result["time_stop_days"] = config.time_stop_days
+    result["strategy_mode"] = config.strategy_mode
+    result["force_exit_same_day"] = config.force_exit_same_day
+    result["execution_quality_note"] = build_execution_quality_note(result, config)
 
     pre_plan_status = validate_pre_plan_gate(result, config)
     if pre_plan_status is not None:
@@ -758,7 +987,7 @@ def build_trade_plan_row(row: dict[str, Any] | pd.Series, config: TradePlanConfi
         result["position_size_lots"] = result["executable_position_size_lots"]
         result["executable_position_value"] = result["theoretical_position_value"]
         result["executable_max_loss_amount"] = result["theoretical_max_loss_amount"]
-    elif status not in {"SKIPPED_NOT_TRADE_CANDIDATE", "INVALID_DATA"}:
+    else:
         result["executable_position_size_lots"] = 0
         result["position_size_lots"] = 0
         result["executable_position_value"] = 0.0
@@ -828,13 +1057,19 @@ def run_stage_4_trade_plan(
     bandarmology_path: str | Path,
     output_path: str | Path,
     config: TradePlanConfig | None = None,
+    orderbook_path: str | Path | None = None,
 ) -> pd.DataFrame:
     config = config or TradePlanConfig()
     candidates = _merge_stage2_bandarmology(stage2_path, bandarmology_path)
+    candidates = _merge_orderbook(candidates, orderbook_path)
     print(f"Stage 4 rows loaded: {len(candidates)}")
     print(
         "Config: "
+        f"strategy_mode={config.strategy_mode}, "
         f"capital={config.capital:.0f}, risk_per_trade_pct={min(config.risk_per_trade_pct, config.max_risk_per_trade_pct):.4f}, "
+        f"tp1_pct={config.tp1_pct:.4f}, tp2_pct={config.tp2_pct:.4f}, max_stop_loss_pct={config.max_stop_loss_pct:.4f}, "
+        f"time_stop_days={config.time_stop_days}, force_exit_same_day={config.force_exit_same_day}, "
+        f"require_orderbook_confirmation={config.require_orderbook_confirmation}, "
         f"bandarmology_min_score={config.bandarmology_min_score}, allow_trade_without_broker_data={config.allow_trade_without_broker_data}"
     )
 

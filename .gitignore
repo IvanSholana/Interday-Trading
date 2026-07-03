@@ -9,3 +9,4 @@ results/
 .env
 data/raw_stockbit/
 data/output/
+data/

@@ -68,7 +68,7 @@ def test_non_trade_candidate_is_skipped_with_nan_plan_fields() -> None:
     assert result["is_plan_valid"] is False
     assert pd.isna(result["entry_price"])
     assert pd.isna(result["risk_reward_tp1"])
-    assert pd.isna(result["executable_position_size_lots"])
+    assert result["executable_position_size_lots"] == 0
 
 
 def test_invalid_data_status() -> None:
@@ -260,7 +260,7 @@ def test_stage4_distribution_is_skipped_before_trade_plan_for_bbri_like_row() ->
     assert pd.isna(result["risk_reward_tp1"])
 
 
-def test_stage4_valid_bandar_context_without_legacy_setup_uses_safe_fallback_plan() -> None:
+def test_stage4_technically_weak_but_liquid_accumulation_is_watch_not_trade() -> None:
     result = build_trade_plan_row(
         bandar_row(
             entry_setup="LIQUID_BUT_WEAK_TREND",
@@ -272,10 +272,123 @@ def test_stage4_valid_bandar_context_without_legacy_setup_uses_safe_fallback_pla
         TradePlanConfig(capital=100_000_000, max_stop_loss_pct=0.10, min_rr_tp1=1.0, min_rr_tp2=1.0),
     )
 
-    assert result["trade_status"] != "SKIPPED_NOT_TRADE_CANDIDATE"
-    assert result["entry_style"] == "MOMENTUM_CONTINUATION"
-    assert pd.notna(result["entry_price"])
-    assert result["prices_are_tick_valid"] is True
+    assert result["trade_status"] == "WATCH_BANDAR_ACCUMULATION_WAIT_TECHNICAL_TRIGGER"
+    assert result["is_plan_valid"] is False
+    assert result["executable_position_size_lots"] == 0
+    assert result["position_size_lots"] == 0
+    assert pd.isna(result["entry_price"])
+
+
+def test_stage4_short_term_accumulation_against_distribution_is_watch() -> None:
+    result = build_trade_plan_row(
+        bandar_row(
+            bandarmology_signal="SHORT_TERM_ACCUMULATION_AGAINST_MEDIUM_DISTRIBUTION",
+            bandarmology_score=62,
+            broker_activity_available=True,
+        ),
+        TradePlanConfig(),
+    )
+
+    assert result["trade_status"] == "WATCH_SHORT_TERM_ACCUMULATION_AGAINST_DISTRIBUTION"
+    assert result["executable_position_size_lots"] == 0
+
+
+def test_stage4_pullback_with_medium_accumulation_is_watch_by_default() -> None:
+    result = build_trade_plan_row(
+        bandar_row(
+            bandarmology_signal="PULLBACK_WITH_MEDIUM_ACCUMULATION",
+            bandarmology_score=64,
+            broker_activity_available=True,
+        ),
+        TradePlanConfig(),
+    )
+
+    assert result["trade_status"] == "WATCH_PULLBACK_WITH_MEDIUM_ACCUMULATION"
+    assert result["executable_position_size_lots"] == 0
+
+
+def test_stage4_orderbook_wait_spread_too_wide_blocks_executable_when_required() -> None:
+    result = build_trade_plan_row(
+        bandar_row(orderbook_status="WAIT_SPREAD_TOO_WIDE", orderbook_score=40),
+        TradePlanConfig(require_orderbook_confirmation=True),
+    )
+
+    assert result["trade_status"] == "WAIT_ORDERBOOK_SPREAD_TOO_WIDE"
+    assert result["is_plan_valid"] is False
+    assert result["executable_position_size_lots"] == 0
+
+
+def test_strategy_mode_defaults_remain_interday() -> None:
+    config = TradePlanConfig()
+
+    assert config.strategy_mode == "interday"
+    assert config.tp1_pct == 0.05
+    assert config.tp2_pct == 0.08
+    assert config.time_stop_days == 10
+    assert config.require_orderbook_confirmation is False
+    assert config.force_exit_same_day is False
+
+
+def test_bpjs_strategy_defaults_are_intraday_execution_strict() -> None:
+    config = TradePlanConfig(strategy_mode="bpjs")
+
+    assert config.tp1_pct == 0.02
+    assert config.tp2_pct == 0.03
+    assert config.max_stop_loss_pct == 0.015
+    assert config.force_exit_same_day is True
+    assert config.time_stop_days == 0
+    assert config.require_orderbook_confirmation is True
+
+
+def test_interday_orderbook_risk_is_note_not_gate_when_not_required() -> None:
+    result = build_trade_plan_row(
+        bandar_row(orderbook_status="WAIT_SPREAD_TOO_WIDE", orderbook_score=40),
+        TradePlanConfig(capital=100_000_000, max_stop_loss_pct=0.04, min_rr_tp1=1.2, min_rr_tp2=1.8),
+    )
+
+    assert result["trade_status"] == "VALID_TRADE_PLAN"
+    assert "WAIT_SPREAD_TOO_WIDE" in result["execution_quality_note"]
+
+
+def test_interday_corporate_action_active_is_watch_by_default() -> None:
+    result = build_trade_plan_row(
+        bandar_row(corp_action_active=True, orderbook_status="REJECT_CORPORATE_ACTION_RISK"),
+        TradePlanConfig(),
+    )
+
+    assert result["trade_status"] == "WATCH_CORPORATE_ACTION_RISK"
+    assert result["executable_position_size_lots"] == 0
+
+
+def test_interday_corporate_action_active_can_be_strict_reject() -> None:
+    result = build_trade_plan_row(
+        bandar_row(corp_action_active=True, orderbook_status="REJECT_CORPORATE_ACTION_RISK"),
+        TradePlanConfig(strict_corporate_action_filter=True),
+    )
+
+    assert result["trade_status"] == "REJECT_CORPORATE_ACTION_RISK"
+    assert result["executable_position_size_lots"] == 0
+
+
+def test_bpjs_requires_supportive_or_neutral_orderbook() -> None:
+    result = build_trade_plan_row(
+        bandar_row(orderbook_status="WAIT_SPREAD_TOO_WIDE", orderbook_score=40),
+        TradePlanConfig(strategy_mode="bpjs"),
+    )
+
+    assert result["trade_status"] == "WAIT_ORDERBOOK_SPREAD_TOO_WIDE"
+    assert result["is_plan_valid"] is False
+    assert result["executable_position_size_lots"] == 0
+
+
+def test_bpjs_corporate_action_active_hard_rejects() -> None:
+    result = build_trade_plan_row(
+        bandar_row(corp_action_active=True, orderbook_status="ORDERBOOK_SUPPORTIVE", orderbook_score=90),
+        TradePlanConfig(strategy_mode="bpjs"),
+    )
+
+    assert result["trade_status"] == "REJECT_CORPORATE_ACTION_RISK"
+    assert result["executable_position_size_lots"] == 0
 
 
 def test_stage4_invalid_plan_keeps_executable_lot_zero() -> None:

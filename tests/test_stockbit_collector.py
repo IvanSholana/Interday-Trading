@@ -6,14 +6,40 @@ from urllib.error import HTTPError
 import pytest
 
 from interday_liquidity_screener import stockbit_collector as collector
-from interday_liquidity_screener.stockbit_collector import StockbitCollectorConfig, get_stockbit_token, parse_number
+from interday_liquidity_screener.stockbit_collector import (
+    StockbitCollectorConfig,
+    get_stockbit_token,
+    parse_number,
+    parse_windows_arg,
+    resolve_window_dates,
+    save_raw_json,
+)
 
 
 def test_parse_number_suffixes_and_symbols() -> None:
     assert parse_number("26.8B") == 26_800_000_000
     assert parse_number("99.4K") == 99_400
     assert parse_number("2,697") == 2697
+    assert parse_number("2.14931e+06") == 2_149_310
     assert parse_number("-") is None
+
+
+def test_parse_windows_arg() -> None:
+    assert parse_windows_arg("1D,3D,5D") == {"1D": 1, "3D": 3, "5D": 5}
+
+
+def test_parse_windows_arg_accepts_powershell_numeric_suffix_loss() -> None:
+    assert parse_windows_arg("1,3,5") == {"1D": 1, "3D": 3, "5D": 5}
+
+
+def test_resolve_window_dates_1d_same_day() -> None:
+    assert resolve_window_dates("2026-07-02", "1D", 1) == ("2026-07-02", "2026-07-02")
+
+
+def test_save_raw_json_multi_window_path(tmp_path) -> None:
+    path = save_raw_json({"data": {}}, "BBRI", "2026-06-29", "2026-07-02", tmp_path, window_label="5D")
+
+    assert path.name == "BBRI_5D_2026-06-29_2026-07-02.json"
 
 
 def test_missing_stockbit_token_raises_clear_error(monkeypatch) -> None:
@@ -118,8 +144,9 @@ def sample_stockbit_payload() -> dict:
 
 
 def test_normalize_real_stockbit_detector_summary() -> None:
-    row = collector.normalize_bandar_detector_summary(sample_stockbit_payload(), "BBRI", "2026-06-01", "2026-06-19")
+    row = collector.normalize_bandar_detector_summary(sample_stockbit_payload(), "BBRI", "2026-06-01", "2026-06-19", "20D", 20)
 
+    assert row["window_label"] == "20D"
     assert row["broker_accdist"] == "Dist"
     assert row["avg_accdist"] == "Big Dist"
     assert row["avg_amount"] == -1140144500000

@@ -3,11 +3,14 @@ from __future__ import annotations
 import pandas as pd
 
 from interday_liquidity_screener.bandarmology import (
+    aggregate_multi_window_scores,
     calculate_bandarmology_score,
     calculate_buyer_seller_features,
     calculate_hhi,
     classify_bandarmology_signal,
+    classify_final_bandarmology_signal,
     build_bandarmology_reason,
+    score_single_window,
 )
 
 
@@ -80,3 +83,85 @@ def test_distribution_detector_does_not_classify_accumulation() -> None:
     assert signal in {"STRONG_DISTRIBUTION", "MILD_DISTRIBUTION"}
     assert signal not in {"STRONG_ACCUMULATION", "MILD_ACCUMULATION"}
     assert "distribution" in build_bandarmology_reason(row)
+
+
+def test_all_big_acc_windows_classify_final_strong_accumulation() -> None:
+    row = {
+        "weighted_bandarmology_score": 85,
+        "accumulation_window_count": 5,
+        "distribution_window_count": 0,
+        "strong_distribution_window_count": 0,
+        "signal_1d": "STRONG_ACCUMULATION",
+        "medium_term_score": 80,
+    }
+
+    assert classify_final_bandarmology_signal(row) == "STRONG_ACCUMULATION"
+
+
+def test_all_big_dist_windows_classify_final_strong_distribution() -> None:
+    row = {
+        "weighted_bandarmology_score": 20,
+        "accumulation_window_count": 0,
+        "distribution_window_count": 5,
+        "strong_distribution_window_count": 5,
+        "signal_1d": "STRONG_DISTRIBUTION",
+        "medium_term_score": 20,
+    }
+
+    assert classify_final_bandarmology_signal(row) == "STRONG_DISTRIBUTION"
+
+
+def test_short_term_accumulation_against_medium_distribution() -> None:
+    row = {
+        "weighted_bandarmology_score": 50,
+        "accumulation_window_count": 1,
+        "distribution_window_count": 3,
+        "strong_distribution_window_count": 1,
+        "signal_1d": "MILD_ACCUMULATION",
+        "medium_term_score": 40,
+    }
+
+    assert classify_final_bandarmology_signal(row) == "SHORT_TERM_ACCUMULATION_AGAINST_MEDIUM_DISTRIBUTION"
+
+
+def test_pullback_with_medium_accumulation() -> None:
+    row = {
+        "weighted_bandarmology_score": 62,
+        "accumulation_window_count": 2,
+        "distribution_window_count": 1,
+        "strong_distribution_window_count": 0,
+        "signal_1d": "MILD_DISTRIBUTION",
+        "medium_term_score": 70,
+    }
+
+    assert classify_final_bandarmology_signal(row) == "PULLBACK_WITH_MEDIUM_ACCUMULATION"
+
+
+def test_missing_window_weights_are_renormalized() -> None:
+    result = aggregate_multi_window_scores({"1D": 100, "3D": None, "5D": 50})
+
+    assert round(result["short_term_score"], 2) == 68.75
+
+
+def test_no_window_scores_classify_no_broker_data() -> None:
+    assert classify_final_bandarmology_signal({"weighted_bandarmology_score": None}) == "NO_BROKER_DATA"
+
+
+def test_single_window_score_clamped() -> None:
+    row = {
+        "broker_activity_available": True,
+        "broker_accdist": "Big Acc",
+        "avg_accdist": "Big Acc",
+        "top3_accdist": "Big Acc",
+        "top5_accdist": "Big Acc",
+        "avg_percent": 100,
+        "avg_amount": 100,
+        "relative_activity_bucket": "VERY_ACTIVE",
+        "technical_context": "BREAKOUT_NEAR",
+        "momentum_score": 100,
+        "close_location": 1,
+        "close": 100,
+        "detector_average_price": 100,
+    }
+
+    assert score_single_window(row, {}) == 100
