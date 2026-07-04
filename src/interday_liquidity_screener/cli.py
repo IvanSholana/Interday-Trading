@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=30, help="Number of top tickers to display.")
     parser.add_argument("--batch-size", type=int, default=ScreenerConfig.batch_size)
     parser.add_argument("--sleep", type=float, default=ScreenerConfig.sleep)
+    parser.add_argument("--market-data-db", default=ScreenerConfig.market_data_db)
+    parser.add_argument("--refresh-market-data", action="store_true")
     parser.add_argument("--debug", action="store_true", help="Print debug information.")
     return parser.parse_args()
 
@@ -44,6 +46,8 @@ def config_from_args(args: argparse.Namespace) -> ScreenerConfig:
         max_return_5d=args.max_return_5d,
         batch_size=args.batch_size,
         sleep=args.sleep,
+        market_data_db=args.market_data_db,
+        refresh_market_data=args.refresh_market_data,
     )
 
 

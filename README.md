@@ -30,6 +30,17 @@ Stage 2 - broad technical context dari hasil stage 1:
 python main.py stage2 --input data\output\stage1_liquidity.csv --output data\output\stage2_technical_context.csv --period 1y
 ```
 
+Stage 1, Stage 2, dan Stage 5 memakai database lokal SQLite untuk OHLCV Yahoo Finance di `data\cache\market_data.sqlite`. Saat run berikutnya, tool membaca histori yang sudah ada dan hanya menarik data setelah tanggal terakhir yang tersimpan. Kalau periode yang diminta lebih panjang dari isi cache, misalnya Stage 2 minta `1y` setelah Stage 1 hanya mengisi `3mo`, cache akan dilengkapi ulang untuk cakupan yang dibutuhkan.
+
+Gunakan opsi ini bila ingin lokasi DB khusus atau force refresh:
+
+```powershell
+python main.py stage1 `
+  --tickers-file examples\tickers.txt `
+  --market-data-db data\cache\market_data.sqlite `
+  --refresh-market-data
+```
+
 Stage 3A - broker summary collector dari Stockbit untuk shortlist Stage 2.
 
 Mode multi-window default untuk bandarmology 1D/3D/5D/10D/20D:
@@ -143,6 +154,7 @@ python main.py stage5-backtest-interday `
   --metrics-output data\output\stage5_interday_metrics.json `
   --equity-output data\output\stage5_interday_equity_curve.csv `
   --price-cache-dir data\cache\ohlcv `
+  --market-data-db data\cache\market_data.sqlite `
   --period 1y `
   --entry-mode next_open `
   --time-stop-days 10 `

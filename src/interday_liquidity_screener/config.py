@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .market_data_cache import DEFAULT_MARKET_DATA_DB
+
 
 @dataclass(frozen=True)
 class ScreenerConfig:
@@ -16,3 +18,5 @@ class ScreenerConfig:
     max_return_5d: float = 0.10
     batch_size: int = 50
     sleep: float = 0.0
+    market_data_db: str = str(DEFAULT_MARKET_DATA_DB)
+    refresh_market_data: bool = False

@@ -1,0 +1,305 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+from pathlib import Path
+import sqlite3
+from typing import Any
+
+import pandas as pd
+
+DEFAULT_MARKET_DATA_DB = Path("data/cache/market_data.sqlite")
+OHLCV_COLUMNS = ["open", "high", "low", "close", "adjusted_close", "volume"]
+
+
+def normalize_ohlcv_frame(data: pd.DataFrame | None, ticker: str | None = None) -> pd.DataFrame:
+    if data is None or data.empty:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+
+    normalized = data.copy()
+    if isinstance(normalized.columns, pd.MultiIndex):
+        if ticker and ticker in normalized.columns.get_level_values(-1):
+            normalized = normalized.xs(ticker, axis=1, level=-1)
+        elif ticker and ticker in normalized.columns.get_level_values(0):
+            normalized = normalized.xs(ticker, axis=1, level=0)
+        else:
+            normalized.columns = normalized.columns.get_level_values(0)
+
+    if "Date" in normalized.columns:
+        normalized["Date"] = pd.to_datetime(normalized["Date"], errors="coerce")
+        normalized = normalized.set_index("Date")
+
+    rename_map = {
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Adj Close": "adjusted_close",
+        "Adj_Close": "adjusted_close",
+        "Volume": "volume",
+    }
+    normalized = normalized.rename(columns=rename_map)
+    normalized.columns = [str(column).strip().lower().replace(" ", "_") for column in normalized.columns]
+    keep = [column for column in OHLCV_COLUMNS if column in normalized.columns]
+    if not keep:
+        return pd.DataFrame(columns=OHLCV_COLUMNS)
+
+    normalized.index = pd.to_datetime(normalized.index, errors="coerce")
+    normalized = normalized[~normalized.index.isna()]
+    normalized.index = normalized.index.tz_localize(None).normalize()
+    normalized = normalized.sort_index()
+    normalized = normalized[keep].copy()
+    for column in keep:
+        normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
+    normalized = normalized.dropna(subset=["open", "high", "low", "close"], how="any")
+    normalized.index.name = "date"
+    return normalized
+
+
+def period_start_date(period: str, today: date | None = None) -> date | None:
+    text = str(period or "").strip().lower()
+    if not text or text == "max":
+        return None
+    today = today or date.today()
+    try:
+        amount = int(text[:-2]) if text.endswith(("mo", "wk")) else int(text[:-1])
+    except ValueError:
+        return None
+    if text.endswith("d"):
+        return today - timedelta(days=amount)
+    if text.endswith("wk"):
+        return today - timedelta(weeks=amount)
+    if text.endswith("mo"):
+        return (pd.Timestamp(today) - pd.DateOffset(months=amount)).date()
+    if text.endswith("y"):
+        return (pd.Timestamp(today) - pd.DateOffset(years=amount)).date()
+    return None
+
+
+class MarketDataCache:
+    def __init__(self, db_path: str | Path = DEFAULT_MARKET_DATA_DB) -> None:
+        self.db_path = Path(db_path)
+
+    def _connect(self) -> sqlite3.Connection:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ohlcv (
+                ticker TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                date TEXT NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                adjusted_close REAL,
+                volume REAL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ticker, interval, date)
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_ohlcv_ticker_interval_date ON ohlcv(ticker, interval, date)")
+        return connection
+
+    def load_ohlcv(
+        self,
+        ticker: str,
+        interval: str = "1d",
+        start_date: str | date | None = None,
+    ) -> pd.DataFrame:
+        params: list[Any] = [ticker, interval]
+        where = "ticker = ? AND interval = ?"
+        if start_date is not None:
+            where += " AND date >= ?"
+            params.append(pd.Timestamp(start_date).date().isoformat())
+        query = f"""
+            SELECT date, open, high, low, close, adjusted_close, volume
+            FROM ohlcv
+            WHERE {where}
+            ORDER BY date
+        """
+        with self._connect() as connection:
+            rows = pd.read_sql_query(query, connection, params=params)
+        if rows.empty:
+            return pd.DataFrame(columns=OHLCV_COLUMNS)
+        rows["date"] = pd.to_datetime(rows["date"], errors="coerce")
+        rows = rows.dropna(subset=["date"]).set_index("date")
+        rows.index = rows.index.normalize()
+        rows.index.name = "date"
+        return rows[OHLCV_COLUMNS]
+
+    def coverage(self, ticker: str, interval: str = "1d") -> tuple[date | None, date | None]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT MIN(date), MAX(date) FROM ohlcv WHERE ticker = ? AND interval = ?",
+                (ticker, interval),
+            ).fetchone()
+        if not row or not row[0] or not row[1]:
+            return None, None
+        return date.fromisoformat(row[0]), date.fromisoformat(row[1])
+
+    def save_ohlcv(self, ticker: str, data: pd.DataFrame, interval: str = "1d") -> int:
+        normalized = normalize_ohlcv_frame(data, ticker)
+        if normalized.empty:
+            return 0
+        rows = []
+        for index, row in normalized.iterrows():
+            rows.append(
+                (
+                    ticker,
+                    interval,
+                    pd.Timestamp(index).date().isoformat(),
+                    _optional_float(row.get("open")),
+                    _optional_float(row.get("high")),
+                    _optional_float(row.get("low")),
+                    _optional_float(row.get("close")),
+                    _optional_float(row.get("adjusted_close")),
+                    _optional_float(row.get("volume")),
+                )
+            )
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO ohlcv (ticker, interval, date, open, high, low, close, adjusted_close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, interval, date) DO UPDATE SET
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    adjusted_close = excluded.adjusted_close,
+                    volume = excluded.volume,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                rows,
+            )
+        return len(rows)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def download_yfinance_ohlcv(
+    tickers: str | list[str],
+    period: str | None = None,
+    interval: str = "1d",
+    start: str | date | None = None,
+    end: str | date | None = None,
+    threads: bool = True,
+) -> pd.DataFrame:
+    import yfinance as yf
+
+    kwargs: dict[str, Any] = {
+        "tickers": tickers,
+        "interval": interval,
+        "auto_adjust": False,
+        "progress": False,
+        "threads": threads,
+        "group_by": "ticker",
+    }
+    if start is not None:
+        kwargs["start"] = pd.Timestamp(start).date().isoformat()
+        if end is not None:
+            kwargs["end"] = pd.Timestamp(end).date().isoformat()
+    else:
+        kwargs["period"] = period
+    return yf.download(**kwargs)
+
+
+def get_incremental_ohlcv(
+    ticker: str,
+    period: str,
+    interval: str = "1d",
+    db_path: str | Path = DEFAULT_MARKET_DATA_DB,
+    refresh: bool = False,
+) -> pd.DataFrame:
+    cache = MarketDataCache(db_path)
+    today = date.today()
+    required_start = period_start_date(period, today)
+    first_cached, last_cached = cache.coverage(ticker, interval)
+
+    fetch_full_period = refresh or first_cached is None
+    if required_start is not None and first_cached is not None and first_cached > required_start:
+        fetch_full_period = True
+
+    if fetch_full_period:
+        fetched = download_yfinance_ohlcv(ticker, period=period, interval=interval, threads=False)
+        cache.save_ohlcv(ticker, fetched, interval)
+    elif last_cached is not None:
+        next_date = last_cached + timedelta(days=1)
+        end_date = today + timedelta(days=1)
+        if next_date <= today:
+            fetched = download_yfinance_ohlcv(ticker, interval=interval, start=next_date, end=end_date, threads=False)
+            cache.save_ohlcv(ticker, fetched, interval)
+
+    return cache.load_ohlcv(ticker, interval, start_date=required_start)
+
+
+def get_incremental_ohlcv_batch(
+    tickers: list[str],
+    period: str,
+    interval: str = "1d",
+    batch_size: int = 50,
+    db_path: str | Path = DEFAULT_MARKET_DATA_DB,
+    refresh: bool = False,
+) -> dict[str, pd.DataFrame]:
+    results: dict[str, pd.DataFrame] = {}
+    cache = MarketDataCache(db_path)
+    today = date.today()
+    required_start = period_start_date(period, today)
+    stale_full: list[str] = []
+    stale_incremental: dict[date, list[str]] = {}
+
+    for ticker in tickers:
+        first_cached, last_cached = cache.coverage(ticker, interval)
+        if refresh or first_cached is None or (required_start is not None and first_cached > required_start):
+            stale_full.append(ticker)
+        elif last_cached is not None and last_cached < today:
+            stale_incremental.setdefault(last_cached + timedelta(days=1), []).append(ticker)
+
+    _fetch_and_store_batches(cache, stale_full, period, interval, batch_size)
+    for start_date, stale_tickers in stale_incremental.items():
+        _fetch_and_store_batches(
+            cache,
+            stale_tickers,
+            period,
+            interval,
+            batch_size,
+            start=start_date,
+            end=today + timedelta(days=1),
+        )
+
+    for ticker in tickers:
+        results[ticker] = cache.load_ohlcv(ticker, interval, start_date=required_start)
+    return results
+
+
+def _fetch_and_store_batches(
+    cache: MarketDataCache,
+    tickers: list[str],
+    period: str,
+    interval: str,
+    batch_size: int,
+    start: date | None = None,
+    end: date | None = None,
+) -> None:
+    if not tickers:
+        return
+    batches = [tickers[index : index + batch_size] for index in range(0, len(tickers), batch_size)]
+    mode = "incremental" if start else "full"
+    for batch_index, batch in enumerate(batches, start=1):
+        print(f"Downloading {mode} OHLCV batch {batch_index}/{len(batches)}: {len(batch)} tickers")
+        data = download_yfinance_ohlcv(batch, period=period, interval=interval, start=start, end=end, threads=True)
+        if data is None or data.empty:
+            continue
+        if len(batch) == 1:
+            cache.save_ohlcv(batch[0], data, interval)
+            continue
+        top_level = set(data.columns.get_level_values(0)) if isinstance(data.columns, pd.MultiIndex) else set()
+        for ticker in batch:
+            ticker_data = data[ticker] if ticker in top_level else pd.DataFrame()
+            cache.save_ohlcv(ticker, ticker_data, interval)

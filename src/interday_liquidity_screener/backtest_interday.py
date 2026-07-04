@@ -7,6 +7,8 @@ from typing import Any
 
 import pandas as pd
 
+from .market_data_cache import DEFAULT_MARKET_DATA_DB, get_incremental_ohlcv, normalize_ohlcv_frame
+
 
 VALID_ENTRY_MODES = {"next_open", "next_day_entry_zone"}
 VALID_AMBIGUOUS_POLICIES = {"stop_first", "tp_first", "skip_trade"}
@@ -63,6 +65,7 @@ SUPPORT_COLUMNS = [
 @dataclass(frozen=True)
 class InterdayBacktestConfig:
     price_cache_dir: str | Path = "data/cache/ohlcv"
+    market_data_db: str | Path = DEFAULT_MARKET_DATA_DB
     period: str = "1y"
     entry_mode: str = "next_open"
     time_stop_days: int = 10
@@ -133,24 +136,9 @@ def _date(value: Any) -> pd.Timestamp | None:
 
 
 def _normalize_price_history(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-    normalized = df.copy()
-    if "Date" in normalized.columns:
-        normalized["Date"] = pd.to_datetime(normalized["Date"], errors="coerce")
-        normalized = normalized.set_index("Date")
-    normalized.index = pd.to_datetime(normalized.index, errors="coerce")
-    normalized = normalized[~normalized.index.isna()]
-    normalized.index = normalized.index.normalize()
-    normalized = normalized.sort_index()
-    normalized.columns = [str(column).strip().lower().replace(" ", "_") for column in normalized.columns]
-    rename_map = {"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"}
-    normalized = normalized.rename(columns=rename_map)
+    normalized = normalize_ohlcv_frame(df)
     keep = [column for column in ["open", "high", "low", "close", "volume"] if column in normalized.columns]
-    normalized = normalized[keep]
-    for column in keep:
-        normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
-    return normalized.dropna(subset=["open", "high", "low", "close"], how="any")
+    return normalized[keep].copy()
 
 
 def load_price_history_from_cache(ticker: str, cache_dir: str | Path) -> pd.DataFrame:
@@ -171,19 +159,7 @@ def save_price_history_to_cache(ticker: str, df: pd.DataFrame, cache_dir: str | 
 
 
 def fetch_price_history(yahoo_ticker: str, period: str) -> pd.DataFrame:
-    import yfinance as yf
-
-    data = yf.download(
-        yahoo_ticker,
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    return _normalize_price_history(data)
+    return get_incremental_ohlcv(yahoo_ticker, period, db_path=DEFAULT_MARKET_DATA_DB)
 
 
 def get_price_history(
@@ -191,15 +167,17 @@ def get_price_history(
     cache_dir: str | Path,
     period: str,
     refresh: bool = False,
+    market_data_db: str | Path = DEFAULT_MARKET_DATA_DB,
 ) -> pd.DataFrame:
+    history = get_incremental_ohlcv(yahoo_ticker, period, db_path=market_data_db, refresh=refresh)
+    if not history.empty:
+        return _normalize_price_history(history)
+
     if not refresh:
         cached = load_price_history_from_cache(yahoo_ticker, cache_dir)
         if not cached.empty:
             return cached
-    fetched = fetch_price_history(yahoo_ticker, period)
-    if not fetched.empty:
-        save_price_history_to_cache(yahoo_ticker, fetched, cache_dir)
-    return fetched
+    return pd.DataFrame()
 
 
 def is_stage4_signal_eligible(row: dict[str, Any] | pd.Series) -> bool:
@@ -545,6 +523,7 @@ def run_stage5_backtest_interday(
                 config.price_cache_dir,
                 config.period,
                 refresh=config.refresh_price_cache,
+                market_data_db=config.market_data_db,
             )
         results.append(simulate_interday_signal(row, histories.get(yahoo_ticker, pd.DataFrame()), config))
 

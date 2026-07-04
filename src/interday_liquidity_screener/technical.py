@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from .market_data_cache import DEFAULT_MARKET_DATA_DB, get_incremental_ohlcv, get_incremental_ohlcv_batch, normalize_ohlcv_frame
+
 LIQUID_BUCKETS = {"HIGH_LIQUIDITY", "GOOD_LIQUIDITY"}
 
 ENTRY_SETUPS = [
@@ -130,115 +132,33 @@ def load_stage_1_candidates(input_path: str | Path) -> pd.DataFrame:
 
 
 def fetch_ohlcv_history(yahoo_ticker: str, period: str = "1y") -> pd.DataFrame:
-    import yfinance as yf
-
-    data = yf.download(
-        tickers=yahoo_ticker,
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-    if data is None or data.empty:
-        return pd.DataFrame()
-
-    if isinstance(data.columns, pd.MultiIndex):
-        if yahoo_ticker in data.columns.get_level_values(-1):
-            data = data.xs(yahoo_ticker, axis=1, level=-1)
-        elif yahoo_ticker in data.columns.get_level_values(0):
-            data = data.xs(yahoo_ticker, axis=1, level=0)
-        else:
-            data.columns = data.columns.get_level_values(0)
-
-    rename_map = {
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Adj Close": "adjusted_close",
-        "Volume": "volume",
-    }
-    data = data.rename(columns=rename_map)
-    columns = [column for column in ["open", "high", "low", "close", "adjusted_close", "volume"] if column in data.columns]
-    data = data[columns].copy()
-    data.index.name = "date"
-    return data
+    return get_incremental_ohlcv(yahoo_ticker, period, db_path=DEFAULT_MARKET_DATA_DB)
 
 
 def _normalize_ohlcv_df(data: pd.DataFrame, ticker: str | None = None) -> pd.DataFrame:
     """Normalize a single-ticker OHLCV DataFrame to standard column names."""
-    if data is None or data.empty:
-        return pd.DataFrame()
-
-    if isinstance(data.columns, pd.MultiIndex):
-        if ticker and ticker in data.columns.get_level_values(-1):
-            data = data.xs(ticker, axis=1, level=-1)
-        elif ticker and ticker in data.columns.get_level_values(0):
-            data = data.xs(ticker, axis=1, level=0)
-        else:
-            data.columns = data.columns.get_level_values(0)
-
-    rename_map = {
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Adj Close": "adjusted_close",
-        "Volume": "volume",
-    }
-    data = data.rename(columns=rename_map)
-    columns = [column for column in ["open", "high", "low", "close", "adjusted_close", "volume"] if column in data.columns]
-    if not columns:
-        return pd.DataFrame()
-    data = data[columns].copy()
-    data.index.name = "date"
-    return data
+    return normalize_ohlcv_frame(data, ticker)
 
 
-def _batch_fetch_ohlcv(tickers: list[str], period: str = "1y", batch_size: int = 50) -> dict[str, pd.DataFrame]:
+def _batch_fetch_ohlcv(
+    tickers: list[str],
+    period: str = "1y",
+    batch_size: int = 50,
+    market_data_db: str | Path = DEFAULT_MARKET_DATA_DB,
+    refresh_market_data: bool = False,
+) -> dict[str, pd.DataFrame]:
     """Batch download OHLCV for multiple tickers efficiently using yfinance multi-ticker mode."""
-    import yfinance as yf
-
-    results: dict[str, pd.DataFrame] = {}
-    if not tickers:
-        return results
-
-    batches = [tickers[i : i + batch_size] for i in range(0, len(tickers), batch_size)]
-    for batch_idx, batch in enumerate(batches, start=1):
-        print(f"Stage 2 downloading batch {batch_idx}/{len(batches)}: {len(batch)} tickers")
-        try:
-            data = yf.download(
-                tickers=batch,
-                period=period,
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-                group_by="ticker",
-            )
-            if data is None or data.empty:
-                for ticker in batch:
-                    results[ticker] = pd.DataFrame()
-                continue
-
-            if len(batch) == 1:
-                results[batch[0]] = _normalize_ohlcv_df(data, batch[0])
-            else:
-                top_level = set(data.columns.get_level_values(0))
-                for ticker in batch:
-                    if ticker in top_level:
-                        ticker_data = data[ticker].copy()
-                        ticker_data.columns = [str(c) for c in ticker_data.columns]
-                        results[ticker] = _normalize_ohlcv_df(ticker_data)
-                    else:
-                        results[ticker] = pd.DataFrame()
-        except Exception as exc:
-            print(f"Batch {batch_idx} download error: {exc}")
-            for ticker in batch:
-                results[ticker] = pd.DataFrame()
-
-    return results
+    try:
+        return get_incremental_ohlcv_batch(
+            tickers,
+            period,
+            batch_size=batch_size,
+            db_path=market_data_db,
+            refresh=refresh_market_data,
+        )
+    except Exception as exc:
+        print(f"Stage 2 OHLCV cache/API error: {exc}")
+        return {ticker: pd.DataFrame() for ticker in tickers}
 
 
 def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -765,6 +685,8 @@ def run_stage_2_technical_screening(
     input_path: str | Path,
     output_path: str | Path,
     period: str = "1y",
+    market_data_db: str | Path = DEFAULT_MARKET_DATA_DB,
+    refresh_market_data: bool = False,
 ) -> pd.DataFrame:
     candidates = load_stage_1_candidates(input_path)
     print(f"Stage 1 candidates loaded: {len(candidates)}")
@@ -774,7 +696,12 @@ def run_stage_2_technical_screening(
 
     # Batch download all tickers at once for efficiency
     yahoo_tickers = candidates["yahoo_ticker"].tolist()
-    histories: dict[str, pd.DataFrame] = _batch_fetch_ohlcv(yahoo_tickers, period)
+    histories: dict[str, pd.DataFrame] = _batch_fetch_ohlcv(
+        yahoo_tickers,
+        period,
+        market_data_db=market_data_db,
+        refresh_market_data=refresh_market_data,
+    )
 
     for _, candidate in candidates.iterrows():
         yahoo_ticker = candidate["yahoo_ticker"]

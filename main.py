@@ -33,12 +33,16 @@ def build_parser() -> argparse.ArgumentParser:
     stage1.add_argument("--top", type=int, default=30)
     stage1.add_argument("--batch-size", type=int, default=50)
     stage1.add_argument("--sleep", type=float, default=0.0)
+    stage1.add_argument("--market-data-db", default="data/cache/market_data.sqlite")
+    stage1.add_argument("--refresh-market-data", action="store_true")
     stage1.add_argument("--debug", action="store_true")
 
     stage2 = subparsers.add_parser("stage2", help="Run stage 2 technical screening.")
     stage2.add_argument("--input", required=True, help="Stage 1 liquidity CSV path.")
     stage2.add_argument("--output", default="results/screening_stage_2_technical.csv")
     stage2.add_argument("--period", default="1y", help="Yahoo history period. Default: 1y")
+    stage2.add_argument("--market-data-db", default="data/cache/market_data.sqlite")
+    stage2.add_argument("--refresh-market-data", action="store_true")
 
     stage3 = subparsers.add_parser("stage3", help="Run stage 3 trade plan and risk management.")
     stage3.add_argument("--input", required=True, help="Stage 2 technical CSV path.")
@@ -116,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     stage5a.add_argument("--metrics-output", default="data/output/stage5_interday_metrics.json")
     stage5a.add_argument("--equity-output", default="data/output/stage5_interday_equity_curve.csv")
     stage5a.add_argument("--price-cache-dir", default="data/cache/ohlcv")
+    stage5a.add_argument("--market-data-db", default="data/cache/market_data.sqlite")
     stage5a.add_argument("--period", default="1y")
     stage5a.add_argument("--entry-mode", choices=["next_open", "next_day_entry_zone"], default="next_open")
     stage5a.add_argument("--time-stop-days", type=int, default=10)
@@ -189,7 +194,13 @@ def main() -> None:
     if args.command == "stage1":
         run_stage_1(args)
     elif args.command == "stage2":
-        run_stage_2_technical_screening(args.input, args.output, period=args.period)
+        run_stage_2_technical_screening(
+            args.input,
+            args.output,
+            period=args.period,
+            market_data_db=args.market_data_db,
+            refresh_market_data=args.refresh_market_data,
+        )
     elif args.command == "stage3":
         config = TradePlanConfig(
             capital=args.capital,
@@ -270,6 +281,7 @@ def main() -> None:
             reject_if_entry_gap_too_high=not args.allow_entry_gap_too_high,
             same_day_ambiguous_policy=args.same_day_ambiguous_policy,
             refresh_price_cache=args.refresh_price_cache,
+            market_data_db=args.market_data_db,
         )
         run_stage5_backtest_interday(args.signals, args.output, args.metrics_output, args.equity_output, config)
     elif args.command == "stage5-paper-bpjs":
