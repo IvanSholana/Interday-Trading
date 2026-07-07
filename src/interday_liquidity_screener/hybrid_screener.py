@@ -515,7 +515,7 @@ def normalize_candidate_row(row: dict[str, Any] | pd.Series) -> dict[str, Any]:
             "close": close,
             "avg_value_20d": _safe_float(_first(raw, ["avg_value_20d", "average_value_20d"])),
             "avg_volume_20d": _safe_float(_first(raw, ["avg_volume_20d", "average_volume_20d"])),
-            "avg_frequency_20d": _safe_float(_first(raw, ["avg_frequency_20d", "average_frequency_20d"])),
+            "avg_frequency_20d": _safe_float(_first(raw, ["avg_frequency_20d", "average_frequency_20d", "frequency"])),
             "rvol": _safe_float(_first(raw, ["rvol", "volume_ratio", "value_ratio"])),
             "return_1d": _safe_float(_first(raw, ["return_1d"])),
             "return_3d": _safe_float(_first(raw, ["return_3d"])),
@@ -554,13 +554,16 @@ def score_liquidity(row: dict[str, Any], config: HybridScreenerConfig) -> ScoreR
     warnings: list[str] = []
     avg_value = _safe_float(row.get("avg_value_20d"))
     avg_volume = _safe_float(row.get("avg_volume_20d"))
+    # avg_frequency_20d is preferred; fall back to live frequency from orderbook
     avg_frequency = _safe_float(row.get("avg_frequency_20d"))
+    if avg_frequency is None:
+        avg_frequency = _safe_float(_first(row, ["frequency_live", "frequency"]))
     rvol = _safe_float(row.get("rvol"))
     score = 0.0
     score += _pct_score(avg_value, cfg.min_avg_value_20d, 40)
     score += _pct_score(avg_volume, cfg.min_avg_volume_20d, 20)
     if avg_frequency is None:
-        warnings.append("avg_frequency_20d_missing")
+        # No frequency data available from any source — assign neutral partial score
         score += 10
     else:
         score += _pct_score(avg_frequency, cfg.min_avg_frequency_20d, 20)
@@ -948,6 +951,8 @@ def stage0_safety(row: dict[str, Any], scores: dict[str, ScoreResult], risk: Ris
     warnings: list[str] = []
     avg_value = _safe_float(row.get("avg_value_20d"))
     avg_frequency = _safe_float(row.get("avg_frequency_20d"))
+    if avg_frequency is None:
+        avg_frequency = _safe_float(_first(row, ["frequency_live", "frequency"]))
     if cfg.hard_skip_fca and (
         _safe_bool(row.get("fca"))
         or _safe_bool(row.get("full_call_auction"))

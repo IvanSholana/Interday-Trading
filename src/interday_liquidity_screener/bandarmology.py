@@ -103,6 +103,11 @@ def calculate_broker_features(df: pd.DataFrame) -> pd.DataFrame:
         row["top3_seller_value"] = float(seller_values.sort_values(ascending=False).head(3).sum())
         row["buyer_hhi"] = calculate_hhi(buyer_values)
         row["seller_hhi"] = calculate_hhi(seller_values)
+        # top3_buyer_dominance: ratio of top3 buyer value vs top3 seller value
+        top3_buy = row["top3_buyer_value"]
+        top3_sell = row["top3_seller_value"]
+        row["top3_buyer_dominance"] = top3_buy / top3_sell if top3_sell > 0 else (None if top3_buy == 0 else float("inf"))
+        row["top3_seller_dominance"] = top3_sell / top3_buy if top3_buy > 0 else (None if top3_sell == 0 else float("inf"))
         row["top_buyer_avg_price"] = row.get("top_buyer_1_avg_price")
         row["top_seller_avg_price"] = row.get("top_seller_1_avg_price")
         row["broker_activity_available"] = bool(buyer_values.sum() > 0 or seller_values.sum() > 0)
@@ -175,6 +180,46 @@ def score_single_window(row: dict[str, Any] | pd.Series, stage2_row: dict[str, A
         score -= 10
     if merged.get("technical_context") in {"TOO_VOLATILE", "TOO_QUIET_ABSOLUTE", "INVALID_DATA"}:
         score -= 20
+
+    # === P1 Task 7: Enhanced contributions ===
+    # 1. Buyer HHI (konsentrasi beli — sinyal satu/beberapa bandar besar dominan)
+    buyer_hhi = merged.get("buyer_hhi")
+    if buyer_hhi is not None and pd.notna(buyer_hhi):
+        buyer_hhi = float(buyer_hhi)
+        if buyer_hhi >= 0.25:
+            score += 10
+        elif buyer_hhi >= 0.15:
+            score += 5
+
+    # 2. Top3 Dominance (ratio top3 buyer vs top3 seller)
+    top3_buyer = merged.get("top3_buyer_value")
+    top3_seller = merged.get("top3_seller_value")
+    if (
+        top3_buyer is not None
+        and top3_seller is not None
+        and pd.notna(top3_buyer)
+        and pd.notna(top3_seller)
+        and float(top3_seller) > 0
+    ):
+        dominance_ratio = float(top3_buyer) / float(top3_seller)
+        if dominance_ratio >= 2.0:
+            score += 10
+        elif dominance_ratio >= 1.3:
+            score += 5
+        elif dominance_ratio <= 0.5:
+            score -= 10
+        elif dominance_ratio <= 0.75:
+            score -= 5
+
+    # 3. Close vs Top Buyer Avg (risiko distribusi jika harga jauh di atas avg beli bandar)
+    close_vs_buyer = merged.get("close_vs_top_buyer_avg")
+    if close_vs_buyer is not None and pd.notna(close_vs_buyer):
+        close_vs_buyer = float(close_vs_buyer)
+        if close_vs_buyer > 0.10:
+            score -= 15
+        elif close_vs_buyer > 0.05:
+            score -= 8
+
     return max(0, min(100, float(score)))
 
 
