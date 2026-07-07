@@ -1,0 +1,101 @@
+capital_profiles:
+  capital_500k:
+    capital: 500000
+    max_position_pct: 1.0
+    max_stock_price: 5000
+    preferred_price_min: 50
+    preferred_price_max: 500
+    min_gross_tp_pct: 0.015
+    target_tp_pct_default: 0.02
+    stop_loss_pct_default: 0.01
+  capital_1m:
+    capital: 1000000
+    max_position_pct: 1.0
+    max_stock_price: 10000
+    preferred_price_min: 50
+    preferred_price_max: 1000
+    min_gross_tp_pct: 0.015
+    target_tp_pct_default: 0.02
+    stop_loss_pct_default: 0.01
+  capital_1_5m:
+    capital: 1500000
+    max_position_pct: 1.0
+    max_stock_price: 15000
+    preferred_price_min: 50
+    preferred_price_max: 1500
+    min_gross_tp_pct: 0.015
+    target_tp_pct_default: 0.02
+    stop_loss_pct_default: 0.01
+
+fees:
+  buy_fee_pct: 0.0015
+  sell_fee_pct: 0.0025
+  round_trip_fee_pct_fallback: 0.0045
+  minimum_buy_fee: 0
+  minimum_sell_fee: 0
+  slippage_pct_default: 0.001
+
+liquidity:
+  min_avg_value_20d: 2000000000
+  min_avg_frequency_20d: 500
+  min_avg_volume_20d: 1000000
+  min_rvol: 0.8
+  good_rvol: 1.5
+
+price_extension:
+  max_return_1d_safe: 0.05
+  max_return_3d_safe: 0.10
+  max_return_5d_safe: 0.15
+  max_distance_ma20_safe: 0.10
+  danger_distance_ma20: 0.15
+  max_distance_top_buyer_avg_safe: 0.07
+
+technical:
+  rsi_min: 40
+  rsi_ideal_min: 45
+  rsi_ideal_max: 70
+  rsi_overbought: 75
+  clv_good: 0.70
+  clv_strong: 0.80
+  ma20_distance_min: -0.05
+  ma20_distance_max: 0.10
+
+smart_money:
+  accumulation_lookbacks: [1, 3, 5, 10, 20]
+  min_accumulation_consistency: 3
+  strong_accumulation_consistency: 4
+  top3_buyer_dominance_good: 0.50
+  top3_buyer_dominance_strong: 0.70
+  max_close_vs_top_buyer_avg_safe: 0.07
+  distribution_penalty_threshold: 3
+  strong_distribution_threshold: 4
+
+orderbook:
+  max_spread_ticks_bpjs: 1
+  max_spread_pct_bpjs: 0.005
+  min_bid_offer_ratio: 0.8
+  ideal_bid_offer_ratio_min: 1.1
+  ideal_bid_offer_ratio_max: 3.0
+  fake_bid_ratio_warning: 5.0
+  offer_wall_ratio_warning: 5.0
+  min_frequency_open_5m: 50
+  min_value_open_5m: 100000000
+  top_levels: 5
+
+watchlist:
+  max_candidates_bpjs: 5
+  max_candidates_default: 10
+
+risk:
+  minimum_net_profit: 5000
+  minimum_risk_reward: 1.2
+  lot_size: 100
+
+safety:
+  hard_skip_uma: true
+  hard_skip_special_notation: true
+  hard_skip_corporate_action: true
+  hard_skip_fca: true
+  hard_market_regime_risk_off: false
+  hard_sector_downtrend: false
+

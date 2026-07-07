@@ -12,6 +12,22 @@ python -m pip install -e ".[dev]"
 
 ## Cara Pakai
 
+Dashboard lokal:
+
+```powershell
+python -m streamlit run src\interday_liquidity_screener\web_app.py
+```
+
+Panduan penggunaan dashboard yang lebih santai dan langkah demi langkah tersedia di [GUIDEBOOK_DASHBOARD.md](GUIDEBOOK_DASHBOARD.md).
+
+Dashboard mendukung mode daftar saham dari file lokal di `data/input/universes`, termasuk semua IDX, saham syariah, LQ45, IDX30, IDX80, JII, Kompas100, SRI-KEHATI, Bisnis-27, dan PEFINDO25. Update file preset tersebut saat konstituen indeks berubah.
+
+Atau setelah package ter-install:
+
+```powershell
+interday-dashboard
+```
+
 Stage 1 - screening likuiditas:
 
 ```powershell
@@ -357,7 +373,7 @@ Output utama:
 - `executable_position_size_lots` dan `position_size_lots` hanya terisi lebih dari 0 jika `is_plan_valid = True`
 - `strategy_mode`, `force_exit_same_day`, dan `execution_quality_note`
 
-Stage 4 memakai parameter modal dan risiko dari CLI. Default `interday`: modal 10 juta, risiko 0.5% per rencana, maksimum risiko 1%, maksimum posisi 20% modal, TP1 5%, TP2 8%, max stop 6%, time stop 10 hari, dan lot size 100 saham. Default `bpjs`: TP1 2%, TP2 3%, max stop 1.5%, force exit same day, dan orderbook wajib supportive/neutral. Trade yang reject/wait/skip tidak pernah menampilkan lot eksekusi aktif.
+Stage 4 memakai parameter modal dan risiko dari CLI/dashboard. Default dashboard: modal 500 ribu, risiko 0.5% per rencana, maksimum risiko 1%, maksimum posisi 20% modal, TP1 5%, TP2 8%, max stop 6%, time stop 10 hari, dan lot size 100 saham. Saham yang nilai 1 lot-nya melebihi batas posisi per saham akan ditolak sebagai `REJECT_POSITION_TOO_SMALL`, termasuk bila sinyalnya hanya watchlist. Default `bpjs`: TP1 2%, TP2 3%, max stop 1.5%, force exit same day, dan orderbook wajib supportive/neutral. Trade yang reject/wait/skip tidak pernah menampilkan lot eksekusi aktif.
 
 Harga Stage 3 dibulatkan ke fraksi harga BEI sebelum validasi final:
 

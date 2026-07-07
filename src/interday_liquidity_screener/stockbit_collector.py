@@ -21,6 +21,53 @@ BANDAR_WINDOWS = {
     "20D": 20,
 }
 
+DETECTOR_METRIC_BLOCKS = ["avg", "avg5", "top1", "top3", "top5", "top10"]
+
+BANDAR_DETECTOR_SUMMARY_COLUMNS = [
+    "ticker",
+    "window_label",
+    "window_days",
+    "from_date",
+    "to_date",
+    "detector_average_price",
+    "broker_accdist",
+    "number_broker_buysell",
+    "total_buyer",
+    "total_seller",
+    "detector_total_value",
+    "detector_total_volume",
+    "raw_bandar_detector_json",
+]
+for _metric_name in DETECTOR_METRIC_BLOCKS:
+    BANDAR_DETECTOR_SUMMARY_COLUMNS.extend(
+        [
+            f"{_metric_name}_accdist",
+            f"{_metric_name}_amount",
+            f"{_metric_name}_percent",
+            f"{_metric_name}_volume",
+        ]
+    )
+del _metric_name
+
+BROKER_SUMMARY_LONG_COLUMNS = [
+    "ticker",
+    "window_label",
+    "window_days",
+    "from_date",
+    "to_date",
+    "side",
+    "rank",
+    "broker_code",
+    "investor_type",
+    "net_lot",
+    "net_value",
+    "gross_volume",
+    "gross_value",
+    "avg_price",
+    "frequency",
+    "raw_item_json",
+]
+
 
 @dataclass(frozen=True)
 class StockbitCollectorConfig:
@@ -280,7 +327,7 @@ def normalize_bandar_detector_summary(
         "detector_total_volume": parse_number(detector.get("volume")),
         "raw_bandar_detector_json": json.dumps(detector, ensure_ascii=False),
     }
-    for name in ["avg", "avg5", "top1", "top3", "top5", "top10"]:
+    for name in DETECTOR_METRIC_BLOCKS:
         block = _metric_block(detector, name)
         prefix = name
         row[f"{prefix}_accdist"] = block.get("accdist")
@@ -468,18 +515,20 @@ def run_stage3a_broker_collector(
             print(f"{ticker}: fetch_failed {exc}")
         time.sleep(config.sleep_seconds)
 
-    broker_output = pd.DataFrame(broker_rows)
+    broker_output = pd.DataFrame(broker_rows, columns=BROKER_SUMMARY_LONG_COLUMNS)
     broker_path = Path(output_path)
     broker_path.parent.mkdir(parents=True, exist_ok=True)
     broker_output.to_csv(broker_path, index=False)
 
-    detector_output = pd.DataFrame(detector_rows)
+    detector_output = pd.DataFrame(detector_rows, columns=BANDAR_DETECTOR_SUMMARY_COLUMNS)
     detector_path = broker_path.with_name("stage3a_bandar_detector_summary.csv")
     detector_output.to_csv(detector_path, index=False)
     print(f"Fetched success: {success}")
     print(f"Failed: {failed}")
     print(f"401 count: {unauthorized}")
     print(f"429 count: {rate_limited}")
+    if detector_output.empty:
+        print("Tidak ada data broker-flow yang berhasil dibaca. Stage 3B akan menandai saham sebagai NO_BROKER_DATA.")
     print(f"Broker summary output path: {broker_path}")
     print(f"Bandar detector summary path: {detector_path}")
     print(f"Raw dir path: {raw_dir}")
@@ -544,8 +593,8 @@ def run_stage3a_broker_collector_multi_window(
     output_base.mkdir(parents=True, exist_ok=True)
     detector_path = output_base / "stage3a_bandar_detector_summary.csv"
     broker_path = output_base / "stage3a_broker_summary_long.csv"
-    detector_output = pd.DataFrame(detector_rows)
-    broker_output = pd.DataFrame(broker_rows)
+    detector_output = pd.DataFrame(detector_rows, columns=BANDAR_DETECTOR_SUMMARY_COLUMNS)
+    broker_output = pd.DataFrame(broker_rows, columns=BROKER_SUMMARY_LONG_COLUMNS)
     detector_output.to_csv(detector_path, index=False)
     broker_output.to_csv(broker_path, index=False)
 
@@ -553,6 +602,8 @@ def run_stage3a_broker_collector_multi_window(
     print(f"Failed: {failed}")
     print(f"401 count: {unauthorized}")
     print(f"429 count: {rate_limited}")
+    if detector_output.empty:
+        print("Tidak ada data broker-flow yang berhasil dibaca. Stage 3B akan menandai saham sebagai NO_BROKER_DATA.")
     print(f"Bandar detector summary path: {detector_path}")
     print(f"Broker summary output path: {broker_path}")
     print(f"Raw dir path: {raw_dir}")

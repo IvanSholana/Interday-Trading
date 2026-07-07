@@ -5,10 +5,12 @@ import pandas as pd
 from interday_liquidity_screener.trade_plan import (
     TradePlanConfig,
     build_trade_plan_row,
+    can_afford_minimum_lot,
     calculate_theoretical_position_size,
     get_idx_tick_size,
     load_stage_2_candidates,
     round_price_to_tick,
+    run_stage_4_trade_plan,
 )
 
 
@@ -144,6 +146,30 @@ def test_position_too_small_is_rejected() -> None:
     assert result["trade_status"] == "REJECT_POSITION_TOO_SMALL"
 
 
+def test_minimum_lot_affordability_uses_position_limit() -> None:
+    assert can_afford_minimum_lot(stage2_row(close=2000), TradePlanConfig(capital=500_000, max_position_pct=0.40))
+    assert not can_afford_minimum_lot(stage2_row(close=2400), TradePlanConfig(capital=500_000, max_position_pct=0.40))
+
+
+def test_expensive_accumulation_does_not_enter_watchlist_when_one_lot_is_too_expensive() -> None:
+    result = build_trade_plan_row(
+        bandar_row(
+            close=2400,
+            entry_price=2400,
+            stop_loss=2320,
+            technical_context="TECHNICALLY_WEAK_BUT_LIQUID",
+            bandarmology_signal="MILD_ACCUMULATION",
+            bandarmology_score=70,
+            broker_activity_available=True,
+        ),
+        TradePlanConfig(capital=500_000, max_position_pct=0.40),
+    )
+
+    assert result["trade_status"] == "REJECT_POSITION_TOO_SMALL"
+    assert result["is_plan_valid"] is False
+    assert result["position_size_lots"] == 0
+
+
 def test_invalid_plan_does_not_expose_executable_lot() -> None:
     result = build_trade_plan_row(
         stage2_row(entry_price=1000, stop_loss=940),
@@ -222,6 +248,95 @@ def test_stage4_strong_accumulation_and_valid_risk_can_be_valid_plan() -> None:
     assert result["trade_status"] == "VALID_TRADE_PLAN"
     assert result["is_plan_valid"] is True
     assert result["executable_position_size_lots"] > 0
+
+
+def test_stage4_without_orderbook_file_creates_draft_pending_orderbook(tmp_path) -> None:
+    stage2_path = tmp_path / "stage2.csv"
+    bandarmology_path = tmp_path / "stage3b.csv"
+    output_path = tmp_path / "stage4.csv"
+    missing_orderbook_path = tmp_path / "missing_stage3c.csv"
+
+    pd.DataFrame([stage2_row()]).to_csv(stage2_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "ticker": "TEST",
+                "bandarmology_score": 80,
+                "bandarmology_signal": "STRONG_ACCUMULATION",
+                "bandarmology_reason": "test",
+                "bandarmology_summary": "test",
+                "broker_activity_available": True,
+            }
+        ]
+    ).to_csv(bandarmology_path, index=False)
+
+    output = run_stage_4_trade_plan(
+        stage2_path,
+        bandarmology_path,
+        output_path,
+        TradePlanConfig(capital=100_000_000, max_stop_loss_pct=0.04, min_rr_tp1=1.2, min_rr_tp2=1.8),
+        orderbook_path=missing_orderbook_path,
+    )
+
+    row = output.iloc[0]
+    assert output_path.exists()
+    assert row["orderbook_status"] == "NOT_CHECKED"
+    assert bool(row["orderbook_confirmation_required"]) is True
+    assert row["trade_status"] == "DRAFT_PLAN_PENDING_ORDERBOOK"
+    assert bool(row["is_plan_valid"]) is False
+    assert row["executable_position_size_lots"] == 0
+    assert row["theoretical_position_size_lots"] > 0
+
+
+def test_stage4_existing_orderbook_file_uses_orderbook_status_normally(tmp_path) -> None:
+    stage2_path = tmp_path / "stage2.csv"
+    bandarmology_path = tmp_path / "stage3b.csv"
+    orderbook_path = tmp_path / "stage3c.csv"
+    output_path = tmp_path / "stage4.csv"
+
+    pd.DataFrame([stage2_row()]).to_csv(stage2_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "ticker": "TEST",
+                "bandarmology_score": 80,
+                "bandarmology_signal": "STRONG_ACCUMULATION",
+                "bandarmology_reason": "test",
+                "bandarmology_summary": "test",
+                "broker_activity_available": True,
+            }
+        ]
+    ).to_csv(bandarmology_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "ticker": "TEST",
+                "orderbook_status": "WAIT_SPREAD_TOO_WIDE",
+                "orderbook_score": 40,
+                "spread_pct": 0.03,
+            }
+        ]
+    ).to_csv(orderbook_path, index=False)
+
+    output = run_stage_4_trade_plan(
+        stage2_path,
+        bandarmology_path,
+        output_path,
+        TradePlanConfig(
+            capital=100_000_000,
+            max_stop_loss_pct=0.04,
+            min_rr_tp1=1.2,
+            min_rr_tp2=1.8,
+            require_orderbook_confirmation=True,
+        ),
+        orderbook_path=orderbook_path,
+    )
+
+    row = output.iloc[0]
+    assert row["orderbook_status"] == "WAIT_SPREAD_TOO_WIDE"
+    assert row["trade_status"] == "WAIT_ORDERBOOK_SPREAD_TOO_WIDE"
+    assert bool(row["is_plan_valid"]) is False
+    assert row["executable_position_size_lots"] == 0
 
 
 def test_stage4_uses_new_gate_not_legacy_entry_setup_for_indf_like_row() -> None:

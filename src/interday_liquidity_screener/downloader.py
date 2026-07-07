@@ -34,4 +34,18 @@ def download_ticker_data(tickers: list[str], config: ScreenerConfig) -> dict[str
         if config.sleep > 0:
             time.sleep(config.sleep)
 
-    return all_data
+    return {ticker: _to_yfinance_columns(data) for ticker, data in all_data.items()}
+
+
+def _to_yfinance_columns(data: pd.DataFrame) -> pd.DataFrame:
+    if data is None or data.empty:
+        return pd.DataFrame()
+    rename_map = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "adjusted_close": "Adj Close",
+        "volume": "Volume",
+    }
+    return data.rename(columns=rename_map)

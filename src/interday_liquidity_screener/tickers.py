@@ -7,8 +7,12 @@ import pandas as pd
 
 def normalize_ticker(raw_ticker: str) -> str | None:
     ticker = raw_ticker.strip().upper()
-    if not ticker:
+    if not ticker or ticker.startswith("#"):
         return None
+    if "#" in ticker:
+        ticker = ticker.split("#", 1)[0].strip()
+        if not ticker:
+            return None
 
     if ticker.endswith(".JK"):
         base = ticker[:-3]

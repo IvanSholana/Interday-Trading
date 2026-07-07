@@ -33,6 +33,7 @@ IDX_TICK_TABLE = [
 
 TRADE_STATUSES = [
     "VALID_TRADE_PLAN",
+    "DRAFT_PLAN_PENDING_ORDERBOOK",
     "SKIPPED_NOT_TRADE_CANDIDATE",
     "SKIPPED_NO_BROKER_DATA",
     "SKIPPED_NO_ORDERBOOK_DATA",
@@ -142,6 +143,7 @@ STAGE3_OUTPUT_COLUMNS = [
     "time_stop_days",
     "strategy_mode",
     "force_exit_same_day",
+    "orderbook_confirmation_required",
     "liquidity_bucket",
     "relative_activity_bucket",
     "technical_context",
@@ -204,7 +206,7 @@ STAGE3_OUTPUT_COLUMNS = [
 
 @dataclass(frozen=True)
 class TradePlanConfig:
-    capital: float = 10_000_000
+    capital: float = 500_000
     risk_per_trade_pct: float = 0.005
     max_risk_per_trade_pct: float = 0.01
     max_position_pct: float = 0.20
@@ -539,11 +541,32 @@ def calculate_theoretical_position_size(
     }
 
 
+def _minimum_lot_reference_price(row: dict[str, Any] | pd.Series) -> float:
+    for column in ["entry_price", "raw_entry_price", "close"]:
+        price = _value(row, column)
+        if price > 0:
+            return price
+    return 0.0
+
+
+def can_afford_minimum_lot(row: dict[str, Any] | pd.Series, config: TradePlanConfig) -> bool:
+    reference_price = _minimum_lot_reference_price(row)
+    if reference_price <= 0:
+        return True
+    minimum_lot_value = reference_price * config.lot_size
+    max_position_value = config.capital * config.max_position_pct
+    return max_position_value >= minimum_lot_value
+
+
 def _status_reason_summary(status: str) -> tuple[str, str]:
     mapping = {
         "VALID_TRADE_PLAN": (
             "valid_trade_plan_with_acceptable_risk_reward_and_position_size",
             "Trade plan is valid under the configured risk limit. Entry, stop-loss, take-profit, and executable position size are defined.",
+        ),
+        "DRAFT_PLAN_PENDING_ORDERBOOK": (
+            "draft_plan_pending_orderbook_confirmation",
+            "Draft trade plan is otherwise valid, but Stage 3C orderbook confirmation has not been checked yet. Do not execute until orderbook is reviewed.",
         ),
         "SKIPPED_NOT_TRADE_CANDIDATE": (
             "skipped_because_stage2_setup_is_not_trade_candidate",
@@ -733,6 +756,8 @@ def build_execution_quality_note(row: dict[str, Any] | pd.Series, config: TradeP
 
 
 def _orderbook_trade_status(row: dict[str, Any] | pd.Series, config: TradePlanConfig) -> str | None:
+    if _bool_value(row.get("orderbook_confirmation_required")) and row.get("orderbook_status") == "NOT_CHECKED":
+        return None
     corp_action_active = _bool_value(row.get("corp_action_active"))
     if config.strategy_mode == "interday":
         if corp_action_active and config.strict_corporate_action_filter:
@@ -798,6 +823,8 @@ def validate_pre_plan_gate(result: dict[str, Any], config: TradePlanConfig) -> s
             return "SKIPPED_LOW_BANDARMOLOGY_SCORE"
         if broker_available and signal not in {"STRONG_ACCUMULATION", "MILD_ACCUMULATION"}:
             return "SKIPPED_NO_BANDAR_CONFIRMATION"
+        if not can_afford_minimum_lot(result, config):
+            return "REJECT_POSITION_TOO_SMALL"
         if technical_context == "TECHNICALLY_WEAK_BUT_LIQUID":
             return "WATCH_BANDAR_ACCUMULATION_WAIT_TECHNICAL_TRIGGER"
         if technical_context not in ACTIVE_TECHNICAL_CONTEXTS:
@@ -813,6 +840,8 @@ def validate_pre_plan_gate(result: dict[str, Any], config: TradePlanConfig) -> s
             return "SKIPPED_NOT_TRADE_CANDIDATE"
         if result.get("technical_context") in {"TOO_VOLATILE", "TOO_QUIET_ABSOLUTE", "INVALID_DATA"}:
             return "SKIPPED_NOT_TRADE_CANDIDATE"
+        if not can_afford_minimum_lot(result, config):
+            return "REJECT_POSITION_TOO_SMALL"
     return None
 
 
@@ -857,12 +886,35 @@ def validate_trade_status(result: dict[str, Any], config: TradePlanConfig) -> st
     if _value(result, "theoretical_position_size_lots") < 1:
         return "REJECT_POSITION_TOO_SMALL"
 
+    if _bool_value(result.get("orderbook_confirmation_required")) and result.get("orderbook_status") == "NOT_CHECKED":
+        return "DRAFT_PLAN_PENDING_ORDERBOOK"
+
     return "VALID_TRADE_PLAN"
 
 
 def _merge_stage2_bandarmology(stage2_path: str | Path, bandarmology_path: str | Path) -> pd.DataFrame:
-    stage2 = pd.read_csv(stage2_path)
-    bandar = pd.read_csv(bandarmology_path)
+    try:
+        stage2 = pd.read_csv(stage2_path)
+        if stage2.empty:
+            raise ValueError("Tidak ada emiten yang lolos screening Stage 2 (Technical). Watchlist kosong.")
+    except (pd.errors.EmptyDataError, ValueError):
+        raise ValueError("Tidak ada emiten yang lolos screening Stage 2 (Technical). Watchlist kosong.")
+
+    try:
+        bandar = pd.read_csv(bandarmology_path)
+    except pd.errors.EmptyDataError:
+        raise ValueError("Tidak ada data hasil analisis bandarmology dari Stage 3B (Data kosong/tidak ada emiten lolos).")
+
+    # Double check if stage2 is empty
+    if len(stage2) == 0:
+        raise ValueError("Tidak ada emiten yang lolos screening Stage 2 (Technical). Watchlist kosong.")
+
+    if len(bandar) == 0:
+        # If bandar is empty, we return an empty DataFrame with the merged columns structure
+        print("Warning: Stage 3B Bandarmology data is empty.")
+        # Create empty df with key columns
+        bandar = pd.DataFrame(columns=["ticker", "broker_activity_available", "bandarmology_score", "bandarmology_signal"])
+
     bandar_columns = [
         column
         for column in bandar.columns
@@ -882,11 +934,15 @@ def _merge_stage2_bandarmology(stage2_path: str | Path, bandarmology_path: str |
 
 def _merge_orderbook(candidates: pd.DataFrame, orderbook_path: str | Path | None) -> pd.DataFrame:
     if not orderbook_path:
-        return candidates
+        return _mark_orderbook_not_checked(candidates)
     path = Path(orderbook_path)
     if not path.exists():
-        raise FileNotFoundError(f"Stage 3C orderbook file not found: {path}")
-    orderbook = pd.read_csv(path)
+        return _mark_orderbook_not_checked(candidates)
+    try:
+        orderbook = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        print("Warning: Orderbook CSV is empty. Skipping orderbook data merge.")
+        return _mark_orderbook_not_checked(candidates)
     keep = [
         column
         for column in orderbook.columns
@@ -912,7 +968,36 @@ def _merge_orderbook(candidates: pd.DataFrame, orderbook_path: str | Path | None
             "near_arb",
         }
     ]
-    return candidates.merge(orderbook[keep], on="ticker", how="left")
+    merged = candidates.merge(orderbook[keep], on="ticker", how="left")
+    merged["orderbook_confirmation_required"] = False
+    return merged
+
+
+def _mark_orderbook_not_checked(candidates: pd.DataFrame) -> pd.DataFrame:
+    output = candidates.copy()
+    output["orderbook_status"] = "NOT_CHECKED"
+    output["orderbook_confirmation_required"] = True
+    for column in [
+        "orderbook_score",
+        "spread_pct",
+        "depth_imbalance_top5",
+        "offer_wall_ratio_top5",
+        "bid_volume_top5",
+        "offer_volume_top5",
+        "fnet",
+        "foreign_net_ratio",
+        "tradable",
+        "uma",
+        "notation",
+        "notation_risky",
+        "corp_action",
+        "corp_action_active",
+        "near_ara",
+        "near_arb",
+    ]:
+        if column not in output.columns:
+            output[column] = pd.NA
+    return output
 
 
 def build_trade_plan_row(row: dict[str, Any] | pd.Series, config: TradePlanConfig) -> dict[str, Any]:
@@ -928,6 +1013,10 @@ def build_trade_plan_row(row: dict[str, Any] | pd.Series, config: TradePlanConfi
     pre_plan_status = validate_pre_plan_gate(result, config)
     if pre_plan_status is not None:
         _nan_plan_fields(result)
+        if pre_plan_status == "REJECT_POSITION_TOO_SMALL":
+            result["theoretical_position_size_lots"] = 0
+            result["theoretical_position_value"] = 0.0
+            result["theoretical_max_loss_amount"] = 0.0
         status = pre_plan_status
     else:
         raw_entry_plan = calculate_entry_plan(result)
@@ -1085,6 +1174,7 @@ def run_stage_4_trade_plan(
     print(f"Total rows: {len(output)}")
     print(f"Rows with broker confirmation: {broker_confirmed}")
     print(f"Valid trade plans: {counts.get('VALID_TRADE_PLAN', 0)}")
+    print(f"Draft plans pending orderbook: {counts.get('DRAFT_PLAN_PENDING_ORDERBOOK', 0)}")
     print(f"Skipped no broker data: {counts.get('SKIPPED_NO_BROKER_DATA', 0)}")
     print(f"Skipped low bandarmology score: {counts.get('SKIPPED_LOW_BANDARMOLOGY_SCORE', 0)}")
     print(f"Rejected risk/reward: {rejected_rr}")

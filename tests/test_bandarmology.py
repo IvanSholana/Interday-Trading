@@ -10,6 +10,7 @@ from interday_liquidity_screener.bandarmology import (
     classify_bandarmology_signal,
     classify_final_bandarmology_signal,
     build_bandarmology_reason,
+    run_stage3b_bandarmology_scoring,
     score_single_window,
 )
 
@@ -165,3 +166,31 @@ def test_single_window_score_clamped() -> None:
     }
 
     assert score_single_window(row, {}) == 100
+
+
+def test_stage3b_handles_empty_stage3a_csv_files(tmp_path) -> None:
+    stage2_path = tmp_path / "stage2.csv"
+    detector_path = tmp_path / "stage3a_bandar_detector_summary.csv"
+    broker_path = tmp_path / "stage3a_broker_summary_long.csv"
+    output_path = tmp_path / "stage3b.csv"
+
+    pd.DataFrame(
+        [
+            {
+                "ticker": "BBRI",
+                "last_date": "2026-07-04",
+                "close": 3000,
+                "relative_activity_bucket": "NORMAL",
+                "technical_context": "BREAKOUT_NEAR",
+                "momentum_score": 60,
+                "close_location": 0.7,
+            }
+        ]
+    ).to_csv(stage2_path, index=False)
+    detector_path.write_text("", encoding="utf-8")
+    broker_path.write_text("", encoding="utf-8")
+
+    result = run_stage3b_bandarmology_scoring(stage2_path, detector_path, broker_path, output_path)
+
+    assert result.loc[0, "bandarmology_signal"] == "NO_BROKER_DATA"
+    assert output_path.exists()

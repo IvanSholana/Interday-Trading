@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from .stockbit_collector import BANDAR_DETECTOR_SUMMARY_COLUMNS, BROKER_SUMMARY_LONG_COLUMNS
+
 SUPPORTIVE_CONTEXTS = {
     "BREAKOUT_NEAR",
     "REBOUND_NEAR_LOW",
@@ -41,12 +43,19 @@ def load_stage2_context(path: str | Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def _read_csv_or_empty(path: str | Path, columns: list[str]) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=columns)
+
+
 def load_bandar_detector(path: str | Path) -> pd.DataFrame:
-    return pd.read_csv(path)
+    return _read_csv_or_empty(path, BANDAR_DETECTOR_SUMMARY_COLUMNS)
 
 
 def load_broker_summary(path: str | Path) -> pd.DataFrame:
-    return pd.read_csv(path)
+    return _read_csv_or_empty(path, BROKER_SUMMARY_LONG_COLUMNS)
 
 
 def calculate_hhi(values: list[float] | pd.Series) -> float:
@@ -350,7 +359,11 @@ def run_stage3b_multi_window_scoring(
         row["as_of_date"] = ticker_windows["to_date"].dropna().max() if not ticker_windows.empty else stage2_row.get("last_date")
         score_by_window: dict[str, float | None] = {}
         for label in WINDOW_LABELS:
-            label_rows = ticker_windows[ticker_windows["window_label"] == label]
+            label_rows = (
+                ticker_windows[ticker_windows["window_label"] == label]
+                if not ticker_windows.empty and "window_label" in ticker_windows.columns
+                else pd.DataFrame()
+            )
             window_row = label_rows.iloc[0] if not label_rows.empty else None
             _copy_window_columns(row, label, window_row)
             score = None if window_row is None else window_row.get("single_window_score")
