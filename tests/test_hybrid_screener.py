@@ -11,6 +11,7 @@ from interday_liquidity_screener.hybrid_screener import (
     build_hybrid_watchlist,
     build_risk_plan,
     normalize_candidate_row,
+    run_hybrid_screener,
     score_liquidity,
     score_orderbook,
     score_price_extension,
@@ -154,6 +155,23 @@ def test_weekend_preparation_never_execution_ready():
     assert result.iloc[0]["final_status"] in {"EARLY_WATCH", "READY_SOON"}
 
 
+def test_runtime_multibar_override_does_not_mutate_multibar_config_shape(tmp_path):
+    input_path = tmp_path / "stage2.csv"
+    output_path = tmp_path / "hybrid.csv"
+    pd.DataFrame([candidate()]).to_csv(input_path, index=False)
+
+    result = run_hybrid_screener(
+        input_path,
+        output_path,
+        mode="bpjs_live",
+        capital_profile="capital_1m",
+        enable_multibar_confirm=True,
+    )
+
+    assert not result.empty
+    assert output_path.exists()
+
+
 def test_missing_broker_flow_and_sector_data_do_not_crash():
     row = candidate(broker_activity_available=False, accumulation_window_count=None, distribution_window_count=None)
     for key in ["broker_net_buy_1d", "broker_net_buy_3d", "broker_net_buy_5d", "broker_net_buy_10d", "broker_net_buy_20d"]:
@@ -195,4 +213,3 @@ def test_hybrid_backtest_compares_required_modes():
     result = compare_hybrid_modes(candidates, {"TEST": bars}, capital_profile="capital_1m")
     assert set(result["mode"]) == {"normal_execution", "smart_money_first", "hybrid_dual_flow"}
     assert "number_of_trades" in result.columns
-

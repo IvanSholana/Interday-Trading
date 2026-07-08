@@ -22,7 +22,7 @@ import pandas as pd
 
 # Handle sys.path setups
 try:
-    from .web_app import (
+    from .pipeline import (
         DEFAULT_RUN_ROOT,
         DEFAULT_MARKET_DATA_DB,
         DEFAULT_INPUT_ROOT,
@@ -42,7 +42,7 @@ except ImportError:
     package_root = Path(__file__).resolve().parents[1]
     if str(package_root) not in sys.path:
         sys.path.insert(0, str(package_root))
-    from interday_liquidity_screener.web_app import (
+    from interday_liquidity_screener.pipeline import (
         DEFAULT_RUN_ROOT,
         DEFAULT_MARKET_DATA_DB,
         DEFAULT_INPUT_ROOT,
@@ -105,7 +105,7 @@ def append_state_log(msg: str):
         pipeline_state.logs.append(f"[{timestamp}] {msg}")
 
 # Background worker for pipeline
-def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: Any):
+def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: Any, resume: bool = False):
     global pipeline_state
     
     with pipeline_state.lock:
@@ -115,7 +115,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
         pipeline_state.logs = []
         pipeline_state.error_message = None
     
-    append_state_log(f"Starting pipeline run. Run ID: {run_paths.run_id}")
+    append_state_log(f"Starting pipeline run. Run ID: {run_paths.run_id}{' (Resuming from failure)' if resume else ''}")
     append_state_log(f"Target Date: {options.run_date}, Strategy: {options.strategy_mode}")
     append_state_log(f"Selected Stages: {', '.join(stages)}")
     
@@ -137,7 +137,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
     
     try:
         # Import stage runner functions
-        from interday_liquidity_screener.web_app import (
+        from interday_liquidity_screener.pipeline import (
             capture_stage,
             run_stage1_screening,
             run_stage_2_technical_screening,
@@ -180,7 +180,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
             append_state_log(f"--- Running stage: {display_name} ({idx+1}/{total_stages}) ---")
             
             if stage == "stage1":
-                results.append(capture_stage("Stage 1 - Liquidity", paths.stage1, lambda: run_stage1_screening(options.tickers_file, paths.stage1, options)))
+                results.append(capture_stage("Stage 1 - Liquidity", paths.stage1, lambda: run_stage1_screening(options.tickers_file, paths.stage1, options), resume=resume))
             elif stage == "stage2":
                 results.append(
                     capture_stage(
@@ -193,6 +193,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                             market_data_db=options.market_data_db,
                             refresh_market_data=options.refresh_market_data,
                         ),
+                        resume=resume,
                     )
                 )
             elif stage == "stage3a":
@@ -209,6 +210,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                             parse_windows_arg(options.windows),
                             config,
                         ),
+                        resume=resume,
                     )
                 )
             elif stage == "stage3b":
@@ -217,6 +219,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                         "Stage 3B - Bandarmology",
                         paths.stage3b,
                         lambda: run_stage3b_bandarmology_scoring(paths.stage2, paths.stage3a_detector, paths.stage3a_broker, paths.stage3b),
+                        resume=resume,
                     )
                 )
             elif stage == "stage3c":
@@ -226,6 +229,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                         "Stage 3C - Orderbook",
                         paths.stage3c,
                         lambda: run_stage3c_orderbook_filter(paths.stage2, paths.stage3b, paths.stage3c, paths.raw_orderbook, config),
+                        resume=resume,
                     )
                 )
             elif stage == "stage4":
@@ -244,6 +248,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                         "Stage 4 - Trade Plan",
                         paths.stage4,
                         lambda: run_stage_4_trade_plan(paths.stage2, paths.stage3b, paths.stage4, config=config, orderbook_path=paths.stage3c),
+                        resume=resume,
                     )
                 )
             elif stage == "hybrid":
@@ -263,7 +268,13 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                             orderbook_path=orderbook_path,
                             date=options.run_date,
                             max_candidates=options.hybrid_max_candidates,
+                            enable_market_regime=options.enable_market_regime,
+                            enable_multibar_confirm=options.enable_multibar_confirm,
+                            enable_adaptive_tp=options.enable_adaptive_tp,
+                            enable_liquidity_sizer=options.enable_liquidity_sizer,
+                            enable_blackout=options.enable_blackout,
                         ),
+                        resume=resume,
                     )
                 )
             elif stage == "stage5":
@@ -284,6 +295,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                             paths.stage5_equity,
                             backtest_config,
                         ),
+                        resume=resume,
                     )
                 )
                 bpjs_config = BpjsPaperConfig(date=options.run_date)
@@ -298,6 +310,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                             bpjs_config,
                             summary_output_path=paths.stage5_bpjs_summary,
                         ),
+                        resume=resume,
                     )
                 )
             elif stage == "stage6":
@@ -317,6 +330,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                             options.run_date,
                             options.hybrid_max_candidates or 30,
                         ),
+                        resume=resume,
                     )
                 )
                 if not _last_failed(results):
@@ -333,6 +347,7 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                                 options.strategy_mode,
                                 dry_run=options.dry_run_llm,
                             ),
+                            resume=resume,
                         )
                     )
             
@@ -388,6 +403,12 @@ class RunRequest(BaseModel):
     strict_corporate_action_filter: bool
     hybrid_mode: str
     hybrid_capital_profile: str
+    enable_market_regime: Optional[bool] = None
+    enable_multibar_confirm: Optional[bool] = None
+    enable_adaptive_tp: Optional[bool] = None
+    enable_liquidity_sizer: Optional[bool] = None
+    enable_blackout: Optional[bool] = None
+    resume_run_id: Optional[str] = None
 
 class SettingsUpdate(BaseModel):
     stockbit_token: str
@@ -395,6 +416,14 @@ class SettingsUpdate(BaseModel):
 
 @app.get("/api/presets")
 def get_presets():
+    """List all available ticker universe presets.
+
+    Returns a list of preset objects, each with:
+    - ``key``: machine-readable identifier (e.g. ``"lq45"``).
+    - ``label``: human-readable name shown in the UI dropdown.
+    - ``description``: short description.
+    - ``ticker_count``: number of tickers in the preset file (0 if file missing).
+    """
     presets_data = []
     for p in UNIVERSE_PRESETS:
         ticker_count = 0
@@ -415,6 +444,19 @@ def get_presets():
 
 @app.get("/api/presets/{key}")
 def get_preset_tickers(key: str):
+    """Return the ticker list for a specific universe preset.
+
+    Args:
+        key: Preset key, e.g. ``"lq45"``, ``"idx80"``, ``"syariah"``.
+             Pass ``"manual"`` to get an empty list (user-defined tickers).
+
+    Returns:
+        ``{"tickers": ["BBCA.JK", "TLKM.JK", ...]}``. Empty list if the
+        preset file does not exist on disk.
+
+    Raises:
+        404: If the preset key is not found in ``UNIVERSE_PRESETS``.
+    """
     if key == "manual":
         return {"tickers": []}
     preset = [p for p in UNIVERSE_PRESETS if p.key == key]
@@ -428,6 +470,18 @@ def get_preset_tickers(key: str):
 
 @app.get("/api/settings")
 def get_settings():
+    """Return current API token configuration status.
+
+    Reads environment variables ``STOCKBIT_TOKEN`` and ``DEEPSEEK_API_KEY``
+    (from process env or ``.env`` file) and reports whether each is set.
+    Never returns the full token — only a masked preview (last 4 chars).
+
+    Returns:
+        ``SettingsState``-compatible dict with keys:
+        ``stockbit_configured``, ``stockbit_token_preview``,
+        ``deepseek_configured``, ``deepseek_key_preview``,
+        ``run_root``, ``market_db``.
+    """
     stockbit_env = token_available("STOCKBIT_TOKEN")
     deepseek_env = token_available("DEEPSEEK_API_KEY")
     
@@ -445,6 +499,19 @@ def get_settings():
 
 @app.post("/api/settings")
 def update_settings(payload: SettingsUpdate):
+    """Persist API tokens to the local ``.env`` file and activate them.
+
+    Tokens are written to ``.env`` in the working directory and immediately
+    applied to ``os.environ`` for the current process via
+    ``apply_runtime_api_keys``.
+
+    Args:
+        payload: ``SettingsUpdate`` with ``stockbit_token`` (full Bearer string
+                 or raw token) and ``deepseek_api_key``.
+
+    Returns:
+        ``{"message": "Settings updated and saved to local .env file."}``
+    """
     apply_runtime_api_keys(payload.stockbit_token, payload.deepseek_api_key)
     
     env_path = Path(".env")
@@ -472,6 +539,20 @@ def update_settings(payload: SettingsUpdate):
 
 @app.get("/api/runs")
 def get_runs():
+    """List all completed and in-progress pipeline runs.
+
+    Scans ``DEFAULT_RUN_ROOT`` (``data/output/ui_runs/``) for run directories
+    named ``YYYYMMDD_HHMMSS`` and returns a summary for each.
+
+    Returns:
+        List of ``RunSummary``-compatible dicts ordered newest-first, each with:
+        ``run``, ``formatted_date``, ``stage1_rows``, ``liquid_rows``,
+        ``valid_trade_plans``, ``closed_trades``, ``win_rate``,
+        ``report_available``. On per-run read errors, ``error`` is included.
+
+    Raises:
+        500: If the runs root directory cannot be scanned at all.
+    """
     try:
         run_dirs = discover_run_dirs(DEFAULT_RUN_ROOT)
         summaries = []
@@ -497,12 +578,26 @@ def get_runs():
 
 @app.get("/api/run-details/{run_id}")
 def get_run_details(run_id: str):
+    """Return stage availability and summary metrics for a specific run.
+
+    Args:
+        run_id: Run directory name, e.g. ``"20260708_091500"``.
+
+    Returns:
+        Dict with:
+        - ``run_id``: echo of the requested ID.
+        - ``summary``: same shape as ``RunSummary``.
+        - ``stages``: mapping of stage key → bool (True if output file exists).
+
+    Raises:
+        404: If the run directory does not exist.
+    """
     run_dir = DEFAULT_RUN_ROOT / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail="Run not found")
         
     available_stages = {}
-    from .web_app import STAGE_FILES
+    from .pipeline import STAGE_FILES
     for stage, filename in STAGE_FILES.items():
         if stage.startswith("stage3a_"):
             p = run_dir / "stockbit" / filename
@@ -528,8 +623,35 @@ def get_run_csv(
     sort_order: str = Query("asc", pattern="^(asc|desc)$"),
     trade_status: Optional[str] = None,
     liquidity_bucket: Optional[str] = None,
-    bandarmology_signal: Optional[str] = None
+    bandarmology_signal: Optional[str] = None,
 ):
+    """Return paginated, filtered, and sorted rows from a stage output CSV.
+
+    Used by the Results Explorer tab to load and display pipeline output data.
+    Supports server-side pagination, global text search, column sort, and
+    filtering by ``trade_status``, ``liquidity_bucket``, and
+    ``bandarmology_signal`` (only applied if the column exists in the CSV).
+
+    Args:
+        run_id: Run directory name (e.g. ``"20260708_091500"``).
+        stage: Stage key (e.g. ``"stage1"``, ``"hybrid_watchlist"``, ``"stage4"``).
+        page: 1-based page number.
+        limit: Rows per page (1–100000).
+        search: Case-insensitive substring match across all columns.
+        sort_by: Column name to sort by.
+        sort_order: ``"asc"`` or ``"desc"``.
+        trade_status: Filter by ``trade_status`` column value.
+        liquidity_bucket: Filter by ``liquidity_bucket`` column value.
+        bandarmology_signal: Filter by ``bandarmology_signal`` column value.
+
+    Returns:
+        Dict with ``records`` (list of row dicts), ``total`` (pre-pagination
+        count after filtering), ``page``, and ``limit``.
+
+    Raises:
+        404: If run directory or stage output file does not exist.
+        500: If the CSV file cannot be parsed.
+    """
     run_dir = DEFAULT_RUN_ROOT / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail="Run not found")
@@ -593,6 +715,18 @@ def get_run_csv(
 
 @app.get("/api/report/{run_id}")
 def get_run_report(run_id: str):
+    """Return the Stage 6 LLM-generated AI report for a run.
+
+    Args:
+        run_id: Run directory name (e.g. ``"20260708_091500"``).
+
+    Returns:
+        ``{"report": "<markdown string>"}`` containing the full report text.
+
+    Raises:
+        404: If the run directory or report file does not exist.
+        500: If the report file cannot be read.
+    """
     run_dir = DEFAULT_RUN_ROOT / run_id
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail="Run not found")
@@ -609,6 +743,17 @@ def get_run_report(run_id: str):
 
 @app.get("/api/status")
 def get_pipeline_status():
+    """Return the real-time status of the currently active (or last) pipeline run.
+
+    This endpoint is polled by the frontend every second while ``isRunning``
+    is true. It is safe to call at any time (returns ``idle`` when no run
+    is active).
+
+    Returns:
+        Dict matching ``PipelineStatus`` in ``frontend/src/types/api.ts``:
+        ``status`` (idle/running/success/failed/cancelled), ``run_id``,
+        ``progress`` (0–100), ``current_stage``, ``error``, ``logs``.
+    """
     global pipeline_state
     with pipeline_state.lock:
         return {
@@ -622,6 +767,18 @@ def get_pipeline_status():
 
 @app.post("/api/cancel")
 def cancel_pipeline():
+    """Request cancellation of the currently running pipeline.
+
+    Sets a threading ``Event`` that the pipeline worker thread checks between
+    stages. The pipeline will complete the current stage before stopping —
+    it does **not** hard-kill mid-stage.
+
+    Returns:
+        ``{"message": "..."}`` confirmation string.
+
+    Raises:
+        400: If no pipeline is currently running.
+    """
     global pipeline_state
     with pipeline_state.lock:
         if pipeline_state.status != "running":
@@ -631,13 +788,34 @@ def cancel_pipeline():
 
 @app.post("/api/run")
 def trigger_run(payload: RunRequest, background_tasks: BackgroundTasks):
+    """Start a new pipeline run or resume a previously failed one.
+
+    If ``resume_run_id`` is provided in the payload, the backend reuses the
+    existing run directory and skips any stages whose output file already exists
+    (see ``capture_stage`` in ``pipeline.py``). Otherwise a fresh ``run_id``
+    is generated and a new directory is created.
+
+    The pipeline runs in a background daemon thread. Poll ``GET /api/status``
+    at ~1s intervals to track progress.
+
+    Args:
+        payload: ``RunRequest`` model (see ``frontend/src/types/api.ts``).
+        background_tasks: FastAPI dependency (unused; thread is spawned directly
+                          for compatibility with the cancel-event mechanism).
+
+    Returns:
+        ``{"message": "Pipeline started", "run_id": "20260708_091500"}``
+
+    Raises:
+        400: If a pipeline is already running, or the ticker list is empty.
+    """
     global pipeline_state
     
     with pipeline_state.lock:
         if pipeline_state.status == "running":
             raise HTTPException(status_code=400, detail="A pipeline is already running")
             
-    run_id = create_run_id()
+    run_id = payload.resume_run_id if payload.resume_run_id else create_run_id()
     run_paths = build_run_paths(DEFAULT_RUN_ROOT, run_id)
     
     tickers_list = []
@@ -676,7 +854,12 @@ def trigger_run(payload: RunRequest, background_tasks: BackgroundTasks):
         hybrid_mode=payload.hybrid_mode,
         hybrid_capital_profile=payload.hybrid_capital_profile,
         hybrid_config_path=Path("config/screener.yml"),
-        hybrid_max_candidates=30
+        hybrid_max_candidates=30,
+        enable_market_regime=payload.enable_market_regime,
+        enable_multibar_confirm=payload.enable_multibar_confirm,
+        enable_adaptive_tp=payload.enable_adaptive_tp,
+        enable_liquidity_sizer=payload.enable_liquidity_sizer,
+        enable_blackout=payload.enable_blackout,
     )
     
     with pipeline_state.lock:
@@ -690,7 +873,7 @@ def trigger_run(payload: RunRequest, background_tasks: BackgroundTasks):
         
     thread = threading.Thread(
         target=run_pipeline_thread,
-        args=(options, payload.stages, run_paths),
+        args=(options, payload.stages, run_paths, bool(payload.resume_run_id)),
         daemon=True
     )
     thread.start()

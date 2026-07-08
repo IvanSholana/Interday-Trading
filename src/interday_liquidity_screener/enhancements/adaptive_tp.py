@@ -12,7 +12,7 @@ from interday_liquidity_screener.trade_plan import round_price_to_tick
 class AdaptiveTPConfig:
     """Configuration for adaptive take-profit calculation."""
 
-    mode: str = "adaptive"  # "adaptive" or "fixed"
+    mode: str = "fixed"  # "adaptive" or "fixed"
     tp1_atr_multiple: float = 1.5
     tp2_atr_multiple: float = 2.5
     min_tp1_atr_multiple: float = 0.5  # Floor: entry + 0.5*ATR

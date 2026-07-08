@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import os
 
-from interday_liquidity_screener.web_app import (
+from interday_liquidity_screener.pipeline import (
     apply_runtime_api_keys,
     build_run_paths,
     create_run_id,

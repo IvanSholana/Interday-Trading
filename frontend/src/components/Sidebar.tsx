@@ -36,9 +36,20 @@ interface SidebarProps {
   setRiskPerTradePct: (r: number) => void;
   maxPositionPct: number;
   setMaxPositionPct: (m: number) => void;
+  enableMarketRegime: boolean;
+  setEnableMarketRegime: (b: boolean) => void;
+  enableMultibarConfirm: boolean;
+  setEnableMultibarConfirm: (b: boolean) => void;
+  enableAdaptiveTp: boolean;
+  setEnableAdaptiveTp: (b: boolean) => void;
+  enableLiquiditySizer: boolean;
+  setEnableLiquiditySizer: (b: boolean) => void;
+  enableBlackout: boolean;
+  setEnableBlackout: (b: boolean) => void;
   isRunning: boolean;
-  onStartRun: () => void;
+  onStartRun: (resumeRunId?: string) => void;
   onCancelRun: () => void;
+  selectedRunId?: string;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -62,9 +73,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
   setRiskPerTradePct,
   maxPositionPct,
   setMaxPositionPct,
+  enableMarketRegime,
+  setEnableMarketRegime,
+  enableMultibarConfirm,
+  setEnableMultibarConfirm,
+  enableAdaptiveTp,
+  setEnableAdaptiveTp,
+  enableLiquiditySizer,
+  setEnableLiquiditySizer,
+  enableBlackout,
+  setEnableBlackout,
   isRunning,
   onStartRun,
   onCancelRun,
+  selectedRunId,
 }) => {
   const [presets, setPresets] = useState<Preset[]>([]);
   const [settings, setSettings] = useState<SettingsState>({
@@ -77,6 +99,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [stockbitToken, setStockbitToken] = useState('');
   const [deepseekKey, setDeepseekKey] = useState('');
   const [showSecrets, setShowSecrets] = useState(false);
+  const [showEdgeEnhancements, setShowEdgeEnhancements] = useState(false);
 
   useEffect(() => {
     // Fetch universes
@@ -299,7 +322,66 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {/* Stages Selection */}
         <div style={{ marginBottom: '24px', borderTop: '1px solid var(--border-glass)', paddingTop: '20px' }}>
-          <h3 style={{ fontSize: '0.95rem', fontWeight: 600, color: 'white', marginBottom: '16px' }}>Tahapan Pipeline</h3>
+          <h3 style={{ fontSize: '0.95rem', fontWeight: 600, color: 'white', marginBottom: '12px' }}>Tahapan Pipeline</h3>
+          
+          {/* Quick Preset Buttons */}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '16px' }}>
+            <button
+              type="button"
+              onClick={() => setSelectedStages(['stage1', 'stage2', 'stage3a', 'stage3b', 'stage3c', 'stage4', 'hybrid', 'stage5', 'stage6'])}
+              style={{
+                padding: '6px 10px',
+                fontSize: '0.75rem',
+                borderRadius: '8px',
+                border: '1px solid var(--border-glass)',
+                background: 'rgba(255, 255, 255, 0.05)',
+                color: 'white',
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+              }}
+              onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.1)'}
+              onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)'}
+            >
+              Semua Stage
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedStages(['stage1', 'stage2', 'stage3a', 'stage3b', 'stage4', 'hybrid', 'stage5', 'stage6'])}
+              style={{
+                padding: '6px 10px',
+                fontSize: '0.75rem',
+                borderRadius: '8px',
+                border: '1px solid var(--border-glass)',
+                background: 'rgba(255, 255, 255, 0.05)',
+                color: 'white',
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+              }}
+              onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.1)'}
+              onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)'}
+            >
+              Fase Malam (H-1)
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedStages(['stage3c', 'stage4', 'hybrid', 'stage5', 'stage6'])}
+              style={{
+                padding: '6px 10px',
+                fontSize: '0.75rem',
+                borderRadius: '8px',
+                border: '1px solid var(--border-glass)',
+                background: 'rgba(255, 255, 255, 0.05)',
+                color: 'white',
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+              }}
+              onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.1)'}
+              onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)'}
+            >
+              Fase Pagi (Live)
+            </button>
+          </div>
+
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
             {allStages.map((s) => (
               <label
@@ -348,6 +430,88 @@ export const Sidebar: React.FC<SidebarProps> = ({
               Simulasi AI Laporan (Stage 6)
             </label>
           </div>
+        </div>
+
+        {/* Edge Enhancements section */}
+        <div style={{ borderTop: '1px solid var(--border-glass)', paddingTop: '20px', marginBottom: '20px' }}>
+          <button
+            type="button"
+            className="btn-secondary"
+            style={{ width: '100%', fontSize: '0.85rem', display: 'flex', justifyContent: 'space-between', padding: '10px 16px' }}
+            onClick={() => setShowEdgeEnhancements(!showEdgeEnhancements)}
+          >
+            <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><Sliders size={14} /> Peningkatan Edge (P1-P3)</span>
+            <span>{showEdgeEnhancements ? '▲' : '▼'}</span>
+          </button>
+
+          {showEdgeEnhancements && (
+            <div style={{ marginTop: '16px', background: 'rgba(0,0,0,0.2)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-glass)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  style={{ accentColor: 'var(--primary)', marginTop: '3px' }}
+                  checked={enableMarketRegime}
+                  onChange={() => setEnableMarketRegime(!enableMarketRegime)}
+                />
+                <div>
+                  <div style={{ color: 'white', fontWeight: 500 }}>Market Regime Filter</div>
+                  <div style={{ fontSize: '0.72rem', color: 'gray', marginTop: '2px' }}>Saring emiten jika tren IHSG sedang Risk-Off</div>
+                </div>
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  style={{ accentColor: 'var(--primary)', marginTop: '3px' }}
+                  checked={enableMultibarConfirm}
+                  onChange={() => setEnableMultibarConfirm(!enableMultibarConfirm)}
+                />
+                <div>
+                  <div style={{ color: 'white', fontWeight: 500 }}>Multi-Bar Confirmation</div>
+                  <div style={{ fontSize: '0.72rem', color: 'gray', marginTop: '2px' }}>Validasi konsistensi breakout/rebound (N-bar)</div>
+                </div>
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  style={{ accentColor: 'var(--primary)', marginTop: '3px' }}
+                  checked={enableAdaptiveTp}
+                  onChange={() => setEnableAdaptiveTp(!enableAdaptiveTp)}
+                />
+                <div>
+                  <div style={{ color: 'white', fontWeight: 500 }}>Adaptive Take Profit</div>
+                  <div style={{ fontSize: '0.72rem', color: 'gray', marginTop: '2px' }}>Target TP dinamis mengikuti volatilitas ATR</div>
+                </div>
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  style={{ accentColor: 'var(--primary)', marginTop: '3px' }}
+                  checked={enableLiquiditySizer}
+                  onChange={() => setEnableLiquiditySizer(!enableLiquiditySizer)}
+                />
+                <div>
+                  <div style={{ color: 'white', fontWeight: 500 }}>Liquidity Position Sizer</div>
+                  <div style={{ fontSize: '0.72rem', color: 'gray', marginTop: '2px' }}>Batasi nilai beli maksimum sesuai volume saham</div>
+                </div>
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  style={{ accentColor: 'var(--primary)', marginTop: '3px' }}
+                  checked={enableBlackout}
+                  onChange={() => setEnableBlackout(!enableBlackout)}
+                />
+                <div>
+                  <div style={{ color: 'white', fontWeight: 500 }}>Blackout Filter</div>
+                  <div style={{ fontSize: '0.72rem', color: 'gray', marginTop: '2px' }}>Hindari beli jika mendekati tanggal aksi korporasi</div>
+                </div>
+              </label>
+            </div>
+          )}
         </div>
 
         {/* Credentials updates */}
@@ -443,10 +607,39 @@ export const Sidebar: React.FC<SidebarProps> = ({
           className="btn-primary"
           style={{ width: '100%' }}
           disabled={isRunning}
-          onClick={onStartRun}
+          onClick={() => onStartRun()}
         >
-          {isRunning ? 'Pipeline Berjalan...' : 'Jalankan Analisis'}
+          {isRunning ? 'Pipeline Berjalan...' : 'Jalankan Analisis Baru'}
         </button>
+        {selectedRunId && (
+          <button
+            type="button"
+            className="btn-secondary"
+            style={{
+              width: '100%',
+              padding: '12px 20px',
+              fontWeight: 600,
+              fontSize: '0.9rem',
+              borderRadius: '12px',
+              border: '1px solid var(--border-glass)',
+              background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.15) 0%, rgba(37, 99, 235, 0.15) 100%)',
+              color: 'var(--primary)',
+              cursor: isRunning ? 'not-allowed' : 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '8px',
+              transition: 'all 0.2s',
+            }}
+            disabled={isRunning}
+            onClick={() => onStartRun(selectedRunId)}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polygon points="5 3 19 12 5 21 5 3" fill="currentColor" />
+            </svg>
+            Lanjutkan Analisis Terpilih
+          </button>
+        )}
       </div>
     </div>
   );

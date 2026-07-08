@@ -27,19 +27,19 @@ Bahasa sederhananya:
 Buka terminal PowerShell di folder project, lalu jalankan:
 
 ```powershell
-python -m streamlit run src\interday_liquidity_screener\web_app.py
+python -m src.interday_liquidity_screener.server
 ```
 
 Kalau package sudah ter-install dan script tersedia:
 
 ```powershell
-interday-dashboard
+interday-web
 ```
 
-Setelah itu buka:
+Setelah itu buka browser Anda di alamat:
 
 ```text
-http://localhost:8501/
+http://localhost:8000/
 ```
 
 ## 3. Alur Harian Yang Disarankan

@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pandas>=2.0",
-    "streamlit>=1.36",
     "yfinance>=0.2.40",
 ]
 
@@ -22,7 +21,6 @@ dev = [
 
 [project.scripts]
 liquidity-screen = "interday_liquidity_screener.cli:main"
-interday-dashboard = "interday_liquidity_screener.web_app:launch"
 interday-web = "interday_liquidity_screener.server:launch"
 
 [tool.setuptools.packages.find]

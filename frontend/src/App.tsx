@@ -1,185 +1,94 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { ProgressVisualizer } from './components/ProgressVisualizer';
 import { ResultsTable } from './components/ResultsTable';
 import { ChartsDashboard } from './components/ChartsDashboard';
 import { ReportViewer } from './components/ReportViewer';
 import { Terminal, Database, Calendar, BarChart3, FileText, LayoutDashboard, DatabaseZap } from 'lucide-react';
+import { usePipeline } from './hooks/usePipeline';
+import type { RunRequest, CapitalProfile } from './types/api';
 
-interface RunSummary {
-  run: string;
-  formatted_date: string;
-  stage1_rows: number;
-  liquid_rows: number;
-  valid_trade_plans: number;
-  closed_trades: number;
-  win_rate: number | null;
-  report_available: boolean;
-  error?: string;
-}
+/** Active navigation tab options. */
+type ActiveTab = 'dashboard' | 'results' | 'charts' | 'report';
 
 export default function App() {
-  // Sidebar config states
-  const [runDate, setRunDate] = useState('2026-07-06');
+  // ── Sidebar / pipeline config state ──────────────────────────────────────
+  const [runDate, setRunDate] = useState<string>('2026-07-06');
   const [strategyMode, setStrategyMode] = useState<'interday' | 'bpjs'>('interday');
-  const [universeKey, setUniverseKey] = useState('lq45');
-  const [tickersText, setTickersText] = useState('');
-  const [capital, setCapital] = useState(10000000);
+  const [universeKey, setUniverseKey] = useState<string>('lq45');
+  const [tickersText, setTickersText] = useState<string>('');
+  const [capital, setCapital] = useState<number>(10000000);
   const [selectedStages, setSelectedStages] = useState<string[]>([
-    'stage1', 'stage2', 'stage3a', 'stage3b', 'stage3c', 'stage4', 'hybrid', 'stage5', 'stage6'
+    'stage1', 'stage2', 'stage3a', 'stage3b', 'stage3c', 'stage4', 'hybrid', 'stage5', 'stage6',
   ]);
-  const [dryRunLlm, setDryRunLlm] = useState(true);
-  const [refreshMarketData, setRefreshMarketData] = useState(false);
-  const [riskPerTradePct, setRiskPerTradePct] = useState(0.5);
-  const [maxPositionPct, setMaxPositionPct] = useState(20.0);
+  const [dryRunLlm, setDryRunLlm] = useState<boolean>(true);
+  const [refreshMarketData, setRefreshMarketData] = useState<boolean>(false);
+  const [riskPerTradePct, setRiskPerTradePct] = useState<number>(0.5);
+  const [maxPositionPct, setMaxPositionPct] = useState<number>(20.0);
 
-  // Runs Explorer
-  const [runsList, setRunsList] = useState<RunSummary[]>([]);
-  const [selectedRunId, setSelectedRunId] = useState<string>('');
+  // Peningkatan Edge (P1–P5) Toggles
+  const [enableMarketRegime, setEnableMarketRegime] = useState<boolean>(false);
+  const [enableMultibarConfirm, setEnableMultibarConfirm] = useState<boolean>(false);
+  const [enableAdaptiveTp, setEnableAdaptiveTp] = useState<boolean>(false);
+  const [enableLiquiditySizer, setEnableLiquiditySizer] = useState<boolean>(false);
+  const [enableBlackout, setEnableBlackout] = useState<boolean>(false);
 
-  // Active Pipeline Execution State
-  const [isRunning, setIsRunning] = useState(false);
-  const [pipelineStatus, setPipelineStatus] = useState('idle');
-  const [pipelineProgress, setPipelineProgress] = useState(0);
-  const [pipelineCurrentStage, setPipelineCurrentStage] = useState('');
-  const [pipelineError, setPipelineError] = useState<string | null>(null);
-  const [pipelineLogs, setPipelineLogs] = useState<string[]>([]);
+  // ── Navigation tab ────────────────────────────────────────────────────────
+  const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard');
 
-  // Navigation tab
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'results' | 'charts' | 'report'>('dashboard');
+  // ── All API + pipeline state via custom hook ───────────────────────────────
+  const {
+    isRunning,
+    pipelineStatus,
+    pipelineProgress,
+    pipelineCurrentStage,
+    pipelineError,
+    pipelineLogs,
+    runsList,
+    selectedRunId,
+    setSelectedRunId,
+    fetchRunsList,
+    handleStartRun,
+    handleCancelRun,
+  } = usePipeline();
 
-  const fetchRunsList = async (selectLatest = false) => {
-    try {
-      const res = await fetch('/api/runs');
-      const data = await res.json();
-      setRunsList(data);
-      if (data.length > 0 && (!selectedRunId || selectLatest)) {
-        setSelectedRunId(data[0].run); // Auto-select latest run
-      }
-    } catch (err) {
-      console.error('Error fetching runs list:', err);
-    }
+  // ── Derive capital profile from capital amount ────────────────────────────
+  const resolveCapitalProfile = (cap: number): CapitalProfile => {
+    if (cap <= 750_000) return 'capital_500k';
+    if (cap <= 1_250_000) return 'capital_1m';
+    return 'capital_1_5m';
   };
 
-  useEffect(() => {
-    // Initial fetch of runs
-    fetchRunsList();
-    // Check if a pipeline is already running on page load
-    (async () => {
-      try {
-        const res = await fetch('/api/status');
-        const data = await res.json();
-        if (data.status === 'running') {
-          setIsRunning(true);
-          setPipelineStatus(data.status);
-          setPipelineProgress(data.progress);
-          setPipelineCurrentStage(data.current_stage);
-          setPipelineError(data.error);
-          setPipelineLogs(data.logs || []);
-          setActiveTab('dashboard');
-        }
-      } catch (err) {
-        console.error('Error checking initial pipeline status:', err);
-      }
-    })();
-  }, []);
-
-  // Poll status while running
-  useEffect(() => {
-    let interval: any = null;
-    if (isRunning) {
-      interval = setInterval(async () => {
-        try {
-          const res = await fetch('/api/status');
-          const data = await res.json();
-          setPipelineStatus(data.status);
-          setPipelineProgress(data.progress);
-          setPipelineCurrentStage(data.current_stage);
-          setPipelineError(data.error);
-          setPipelineLogs(data.logs || []);
-
-          if (data.status !== 'running') {
-            setIsRunning(false);
-            // Refresh runs list to include the new run and select it
-            if (data.run_id) {
-              await fetchRunsList(true);
-              setSelectedRunId(data.run_id);
-            } else {
-              await fetchRunsList();
-            }
-          }
-        } catch (err) {
-          console.error('Error polling status:', err);
-        }
-      }, 1000);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
+  // ── Build RunRequest payload and delegate to hook ─────────────────────────
+  const onStartRun = async (resumeRunId?: string): Promise<void> => {
+    const payload: RunRequest = {
+      tickers: tickersText,
+      universe_key: universeKey,
+      run_date: runDate,
+      strategy_mode: strategyMode,
+      stages: selectedStages,
+      capital,
+      risk_per_trade_pct: riskPerTradePct / 100,
+      max_position_pct: maxPositionPct / 100,
+      bandarmology_min_score: 60,
+      dry_run_llm: dryRunLlm,
+      refresh_market_data: refreshMarketData,
+      allow_trade_without_broker_data: false,
+      require_orderbook_confirmation: strategyMode === 'bpjs' ? true : null,
+      strict_corporate_action_filter: false,
+      hybrid_mode: strategyMode === 'bpjs' ? 'bpjs_live' : 'normal_execution',
+      hybrid_capital_profile: resolveCapitalProfile(capital),
+      enable_market_regime: enableMarketRegime,
+      enable_multibar_confirm: enableMultibarConfirm,
+      enable_adaptive_tp: enableAdaptiveTp,
+      enable_liquidity_sizer: enableLiquiditySizer,
+      enable_blackout: enableBlackout,
     };
-  }, [isRunning]);
-
-  const handleStartRun = async () => {
-    if (isRunning) return;
-    setIsRunning(true);
-    setPipelineStatus('running');
-    setPipelineProgress(0);
-    setPipelineLogs(['[SYS] Inisialisasi pipeline request ke backend...']);
-    setActiveTab('dashboard'); // Switch to dashboard to watch logs
-
-    try {
-      const res = await fetch('/api/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          tickers: tickersText,
-          universe_key: universeKey,
-          run_date: runDate,
-          strategy_mode: strategyMode,
-          stages: selectedStages,
-          capital,
-          risk_per_trade_pct: riskPerTradePct / 100,
-          max_position_pct: maxPositionPct / 100,
-          bandarmology_min_score: 60,
-          dry_run_llm: dryRunLlm,
-          refresh_market_data: refreshMarketData,
-          allow_trade_without_broker_data: false,
-          require_orderbook_confirmation: strategyMode === 'bpjs' ? true : null,
-          strict_corporate_action_filter: false,
-          hybrid_mode: strategyMode === 'bpjs' ? 'bpjs_live' : 'normal_execution',
-          hybrid_capital_profile: capital <= 750000 ? 'capital_500k' : (capital <= 1250000 ? 'capital_1m' : 'capital_1_5m'),
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || 'Failed to start pipeline');
-      }
-      const data = await res.json();
-      setPipelineLogs((prev) => [...prev, `[SYS] Pipeline berhasil distart dengan ID: ${data.run_id}`]);
-    } catch (err: any) {
-      console.error(err);
-      setIsRunning(false);
-      setPipelineStatus('failed');
-      setPipelineError(err.message || 'Error triggering run');
-      setPipelineLogs((prev) => [...prev, `[ERR] Gagal menjalankan pipeline: ${err.message}`]);
-    }
+    setActiveTab('dashboard');
+    await handleStartRun(payload, resumeRunId);
   };
 
-  const handleCancelRun = async () => {
-    try {
-      setPipelineLogs((prev) => [...prev, '[SYS] Mengirim permintaan pembatalan pipeline...']);
-      const res = await fetch('/api/cancel', { method: 'POST' });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || 'Gagal membatalkan pipeline');
-      }
-      setPipelineLogs((prev) => [...prev, '[SYS] Permintaan pembatalan dikirim. Menunggu stage saat ini selesai...']);
-    } catch (err: any) {
-      console.error(err);
-      setPipelineLogs((prev) => [...prev, `[ERR] Gagal membatalkan: ${err.message}`]);
-    }
-  };
-
-  // Find currently selected run summary details
+  // ── Derived values ────────────────────────────────────────────────────────
   const selectedRunSummary = runsList.find((r) => r.run === selectedRunId);
 
   return (
@@ -206,14 +115,25 @@ export default function App() {
         setRiskPerTradePct={setRiskPerTradePct}
         maxPositionPct={maxPositionPct}
         setMaxPositionPct={setMaxPositionPct}
+        enableMarketRegime={enableMarketRegime}
+        setEnableMarketRegime={setEnableMarketRegime}
+        enableMultibarConfirm={enableMultibarConfirm}
+        setEnableMultibarConfirm={setEnableMultibarConfirm}
+        enableAdaptiveTp={enableAdaptiveTp}
+        setEnableAdaptiveTp={setEnableAdaptiveTp}
+        enableLiquiditySizer={enableLiquiditySizer}
+        setEnableLiquiditySizer={setEnableLiquiditySizer}
+        enableBlackout={enableBlackout}
+        setEnableBlackout={setEnableBlackout}
         isRunning={isRunning}
-        onStartRun={handleStartRun}
+        onStartRun={onStartRun}
         onCancelRun={handleCancelRun}
+        selectedRunId={selectedRunId}
       />
 
       {/* Main dashboard content area */}
       <div className="content-wrapper">
-        
+
         {/* Top Header / Run Selector */}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '20px', justifyContent: 'space-between', alignItems: 'center', marginBottom: '32px' }}>
           <div>
@@ -276,89 +196,43 @@ export default function App() {
 
         {/* Navigation Tabs */}
         <div style={{ display: 'flex', gap: '8px', borderBottom: '1px solid var(--border-glass)', paddingBottom: '1px', marginBottom: '24px' }}>
-          <button
-            onClick={() => setActiveTab('dashboard')}
-            className={`btn-secondary`}
-            style={{
-              borderRadius: '8px 8px 0 0',
-              borderBottom: 'none',
-              background: activeTab === 'dashboard' ? 'var(--bg-card)' : 'transparent',
-              borderColor: activeTab === 'dashboard' ? 'var(--border-glass)' : 'transparent',
-              color: activeTab === 'dashboard' ? 'var(--primary)' : 'var(--text-secondary)',
-              fontWeight: activeTab === 'dashboard' ? 600 : 400,
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              padding: '12px 20px'
-            }}
-          >
-            <LayoutDashboard size={16} />
-            Dashboard Run
-          </button>
-
-          {selectedRunId && (
-            <>
+          {(['dashboard', 'results', 'charts', 'report'] as const).map((tab) => {
+            const icons: Record<ActiveTab, React.ReactNode> = {
+              dashboard: <LayoutDashboard size={16} />,
+              results: <Database size={16} />,
+              charts: <BarChart3 size={16} />,
+              report: <FileText size={16} />,
+            };
+            const labels: Record<ActiveTab, string> = {
+              dashboard: 'Dashboard Run',
+              results: 'Results Explorer',
+              charts: 'Charts & Analisis',
+              report: 'Laporan Analis AI',
+            };
+            if (tab !== 'dashboard' && !selectedRunId) return null;
+            return (
               <button
-                onClick={() => setActiveTab('results')}
-                className={`btn-secondary`}
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className="btn-secondary"
                 style={{
                   borderRadius: '8px 8px 0 0',
                   borderBottom: 'none',
-                  background: activeTab === 'results' ? 'var(--bg-card)' : 'transparent',
-                  borderColor: activeTab === 'results' ? 'var(--border-glass)' : 'transparent',
-                  color: activeTab === 'results' ? 'var(--primary)' : 'var(--text-secondary)',
-                  fontWeight: activeTab === 'results' ? 600 : 400,
+                  background: activeTab === tab ? 'var(--bg-card)' : 'transparent',
+                  borderColor: activeTab === tab ? 'var(--border-glass)' : 'transparent',
+                  color: activeTab === tab ? 'var(--primary)' : 'var(--text-secondary)',
+                  fontWeight: activeTab === tab ? 600 : 400,
                   display: 'flex',
                   alignItems: 'center',
                   gap: '8px',
-                  padding: '12px 20px'
+                  padding: '12px 20px',
                 }}
               >
-                <Database size={16} />
-                Results Explorer
+                {icons[tab]}
+                {labels[tab]}
               </button>
-
-              <button
-                onClick={() => setActiveTab('charts')}
-                className={`btn-secondary`}
-                style={{
-                  borderRadius: '8px 8px 0 0',
-                  borderBottom: 'none',
-                  background: activeTab === 'charts' ? 'var(--bg-card)' : 'transparent',
-                  borderColor: activeTab === 'charts' ? 'var(--border-glass)' : 'transparent',
-                  color: activeTab === 'charts' ? 'var(--primary)' : 'var(--text-secondary)',
-                  fontWeight: activeTab === 'charts' ? 600 : 400,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                  padding: '12px 20px'
-                }}
-              >
-                <BarChart3 size={16} />
-                Charts & Analisis
-              </button>
-
-              <button
-                onClick={() => setActiveTab('report')}
-                className={`btn-secondary`}
-                style={{
-                  borderRadius: '8px 8px 0 0',
-                  borderBottom: 'none',
-                  background: activeTab === 'report' ? 'var(--bg-card)' : 'transparent',
-                  borderColor: activeTab === 'report' ? 'var(--border-glass)' : 'transparent',
-                  color: activeTab === 'report' ? 'var(--primary)' : 'var(--text-secondary)',
-                  fontWeight: activeTab === 'report' ? 600 : 400,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                  padding: '12px 20px'
-                }}
-              >
-                <FileText size={16} />
-                Laporan Analis AI
-              </button>
-            </>
-          )}
+            );
+          })}
         </div>
 
         {/* Tab Contents */}
@@ -372,15 +246,12 @@ export default function App() {
               logs={pipelineLogs}
             />
           )}
-
           {activeTab === 'results' && selectedRunId && (
             <ResultsTable runId={selectedRunId} />
           )}
-
           {activeTab === 'charts' && selectedRunId && (
             <ChartsDashboard runId={selectedRunId} />
           )}
-
           {activeTab === 'report' && selectedRunId && (
             <ReportViewer runId={selectedRunId} />
           )}

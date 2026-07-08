@@ -12,21 +12,21 @@ python -m pip install -e ".[dev]"
 
 ## Cara Pakai
 
-Dashboard lokal:
+Dashboard lokal (React + FastAPI):
 
 ```powershell
-python -m streamlit run src\interday_liquidity_screener\web_app.py
+python -m src.interday_liquidity_screener.server
+```
+
+Atau setelah package ter-install:
+
+```powershell
+interday-web
 ```
 
 Panduan penggunaan dashboard yang lebih santai dan langkah demi langkah tersedia di [GUIDEBOOK_DASHBOARD.md](GUIDEBOOK_DASHBOARD.md).
 
 Dashboard mendukung mode daftar saham dari file lokal di `data/input/universes`, termasuk semua IDX, saham syariah, LQ45, IDX30, IDX80, JII, Kompas100, SRI-KEHATI, Bisnis-27, dan PEFINDO25. Update file preset tersebut saat konstituen indeks berubah.
-
-Atau setelah package ter-install:
-
-```powershell
-interday-dashboard
-```
 
 Stage 1 - screening likuiditas:
 

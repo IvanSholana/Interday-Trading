@@ -9,6 +9,7 @@ from dataclasses import dataclass
 class LiquiditySizerConfig:
     """Configuration for liquidity-based position sizing."""
 
+    enabled: bool = False
     max_pct_of_avg_value_20d: float = 0.10  # Max 10% of avg daily value
 
 
