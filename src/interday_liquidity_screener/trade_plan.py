@@ -1263,8 +1263,27 @@ def build_trade_plan_row(row: dict[str, Any] | pd.Series, config: TradePlanConfi
         result["raw_entry_zone_low"] = raw_entry_plan["entry_zone_low"]
         result["raw_entry_zone_high"] = raw_entry_plan["entry_zone_high"]
         result["raw_stop_loss"] = raw_stop_loss
-        result["raw_take_profit_1"] = raw_entry_price * (1 + config.tp1_pct) if raw_entry_price > 0 else pd.NA
-        result["raw_take_profit_2"] = raw_entry_price * (1 + config.tp2_pct) if raw_entry_price > 0 else pd.NA
+
+        # Compute adaptive TP1: must be at least enough to satisfy min_rr_tp1
+        # after tick-rounding, while keeping the configured tp1_pct as a floor.
+        fixed_tp1 = raw_entry_price * (1 + config.tp1_pct) if raw_entry_price > 0 else pd.NA
+        fixed_tp2 = raw_entry_price * (1 + config.tp2_pct) if raw_entry_price > 0 else pd.NA
+        if raw_entry_price > 0 and pd.notna(raw_stop_loss) and raw_stop_loss < raw_entry_price:
+            raw_risk = raw_entry_price - raw_stop_loss
+            # Minimum TP1 that guarantees R:R >= min_rr_tp1 even after floor-rounding.
+            # Add one tick as buffer because both TP (floor) and SL (floor) shift adversely.
+            tick = get_idx_tick_size(raw_entry_price)
+            setup = _plan_setup(result)
+            min_rr = config.rebound_min_rr_tp1 if setup == "REBOUND_CANDIDATE" else config.min_rr_tp1
+            minimum_tp1 = raw_entry_price + (raw_risk * min_rr) + tick
+            result["raw_take_profit_1"] = max(fixed_tp1, minimum_tp1) if pd.notna(fixed_tp1) else minimum_tp1
+
+            min_rr2 = config.rebound_min_rr_tp2 if setup == "REBOUND_CANDIDATE" else config.min_rr_tp2
+            minimum_tp2 = raw_entry_price + (raw_risk * min_rr2) + tick
+            result["raw_take_profit_2"] = max(fixed_tp2, minimum_tp2) if pd.notna(fixed_tp2) else minimum_tp2
+        else:
+            result["raw_take_profit_1"] = fixed_tp1
+            result["raw_take_profit_2"] = fixed_tp2
 
         if raw_entry_price <= 0 or pd.isna(raw_entry_plan["entry_price"]) or pd.isna(raw_stop_loss):
             for column in [

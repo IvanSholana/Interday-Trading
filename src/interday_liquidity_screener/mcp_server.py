@@ -11,10 +11,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import sys
+import threading
+import time
+import traceback
+import uuid
 from typing import Optional
 
 import pandas as pd
@@ -50,6 +55,7 @@ try:
         DEFAULT_MARKET_DATA_DB,
         DEFAULT_RUN_ROOT,
         PipelineOptions,
+        STAGE_FILES,
         build_run_paths,
         create_run_id,
         discover_run_dirs,
@@ -80,6 +86,7 @@ except ImportError:
         DEFAULT_MARKET_DATA_DB,
         DEFAULT_RUN_ROOT,
         PipelineOptions,
+        STAGE_FILES,
         build_run_paths,
         create_run_id,
         discover_run_dirs,
@@ -106,6 +113,17 @@ except ImportError:
 
 
 mcp = FastMCP("IDX Trading Screener")
+
+logger = logging.getLogger("interday_liquidity_screener.mcp_server")
+
+# In-memory registry for background (non-blocking) pipeline jobs. Keyed by
+# job_id. Guarded by _JOBS_LOCK because the MCP server may service concurrent
+# tool calls while a worker thread mutates a job record.
+_JOBS: dict[str, dict[str, object]] = {}
+_JOBS_LOCK = threading.Lock()
+# Keep at most this many finished MCP ticker input files around; older ones are
+# pruned on each new (non-resume) run to stop data/input from growing forever.
+MCP_TICKER_FILE_KEEP = 30
 
 ALLOWED_OUTPUT_FORMATS = {"markdown", "json"}
 ALLOWED_RUN_PHASES = {"malam", "pagi", "semua"}
@@ -169,6 +187,22 @@ MCP_CAPABILITIES = [
         safety_note="Reuses the original ticker file for the resumed run to avoid accidental universe switching.",
     ),
     McpToolCapability(
+        name="start_pipeline_run",
+        category="pipeline_execution",
+        mutation_level="writes_run_artifacts",
+        when_to_use="Non-blocking alternative to run_trading_pipeline. Returns a job_id immediately and runs the scan in the background so the agent stays responsive.",
+        output_formats=["markdown", "json"],
+        safety_note="Creates or updates run artifacts asynchronously. Poll get_pipeline_run_status(job_id) for progress and the final run_id.",
+    ),
+    McpToolCapability(
+        name="get_pipeline_run_status",
+        category="pipeline_execution",
+        mutation_level="read_only",
+        when_to_use="Poll the status of a background job started by start_pipeline_run.",
+        output_formats=["markdown", "json"],
+        safety_note="Reads in-memory job state only; it does not start, mutate, or cancel runs.",
+    ),
+    McpToolCapability(
         name="get_run_audit",
         category="decision_support",
         mutation_level="read_only",
@@ -197,7 +231,7 @@ MCP_CAPABILITIES = [
         category="inspection",
         mutation_level="read_only",
         when_to_use="Inspect ranked hybrid watchlist rows for a completed run.",
-        output_formats=["markdown"],
+        output_formats=["markdown", "json"],
         safety_note="Does not apply capital-aware portfolio policy; use get_trade_recommendation for execution review.",
     ),
     McpToolCapability(
@@ -205,23 +239,31 @@ MCP_CAPABILITIES = [
         category="inspection",
         mutation_level="read_only",
         when_to_use="Inspect per-stage artifact summaries and available files for a specific run.",
-        output_formats=["markdown"],
+        output_formats=["markdown", "json"],
         safety_note="Useful for debugging before rerunning pipeline stages.",
+    ),
+    McpToolCapability(
+        name="get_run_bundle",
+        category="decision_support",
+        mutation_level="read_only",
+        when_to_use="One-shot fetch that combines run summary, audit, watchlist, and capital-aware recommendation to minimize round trips.",
+        output_formats=["markdown", "json"],
+        safety_note="Aggregates existing read-only tools only; it does not create new signals or place orders.",
     ),
     McpToolCapability(
         name="list_pipeline_runs",
         category="inspection",
         mutation_level="read_only",
         when_to_use="List historical runs before selecting a run_id for audit or recommendation.",
-        output_formats=["markdown"],
-        safety_note="Reads run directories only.",
+        output_formats=["markdown", "json"],
+        safety_note="Reads run directories only. Supports a limit to keep output compact.",
     ),
     McpToolCapability(
         name="get_presets_info",
         category="universe",
         mutation_level="read_only",
         when_to_use="Discover available ticker universe presets and ticker counts.",
-        output_formats=["markdown"],
+        output_formats=["markdown", "json"],
         safety_note="Preset counts depend on local files.",
     ),
     McpToolCapability(
@@ -229,7 +271,7 @@ MCP_CAPABILITIES = [
         category="universe",
         mutation_level="read_only",
         when_to_use="Inspect tickers inside one preset before running a scan.",
-        output_formats=["markdown"],
+        output_formats=["markdown", "json"],
         safety_note="Does not validate whether each ticker currently trades.",
     ),
     McpToolCapability(
@@ -237,7 +279,7 @@ MCP_CAPABILITIES = [
         category="reporting",
         mutation_level="read_only",
         when_to_use="Read Stage 6 markdown report for a completed run.",
-        output_formats=["markdown"],
+        output_formats=["markdown", "json"],
         safety_note="Report may be dry-run/mock depending on pipeline configuration.",
     ),
     McpToolCapability(
@@ -245,7 +287,7 @@ MCP_CAPABILITIES = [
         category="market_data",
         mutation_level="writes_cache_artifacts",
         when_to_use="Scan configured Stockbit brokers for smart-money accumulation activity.",
-        output_formats=["markdown"],
+        output_formats=["markdown", "json"],
         safety_note="May fetch live Stockbit data and write the configured scan output/cache file.",
     ),
     McpToolCapability(
@@ -253,7 +295,7 @@ MCP_CAPABILITIES = [
         category="market_data",
         mutation_level="writes_cache_artifacts",
         when_to_use="Inspect global commodity prices and daily changes for market context.",
-        output_formats=["markdown"],
+        output_formats=["markdown", "json"],
         safety_note="May fetch live commodity data and update its daily cache.",
     ),
     McpToolCapability(
@@ -515,7 +557,9 @@ def _capabilities_payload() -> dict[str, object]:
             "get_mcp_capabilities",
             "get_system_health",
             "get_recommendation_policy",
-            "run_trading_pipeline or list_pipeline_runs",
+            "run_trading_pipeline (blocking) or start_pipeline_run (non-blocking) or list_pipeline_runs",
+            "get_pipeline_run_status when a background run was started",
+            "get_run_bundle for a one-shot audit + watchlist + recommendation",
             "get_run_audit",
             "get_trade_recommendation",
             "run_morning_confirmation when live orderbook confirmation is required",
@@ -681,33 +725,73 @@ def get_system_health(output_format: str = "markdown") -> str:
 
 
 @mcp.tool()
-def get_presets_info() -> str:
+def get_presets_info(output_format: str = "markdown") -> str:
     """List all available ticker universe presets (e.g. LQ45, IDX80, Syariah) and descriptions.
 
     Use this tool to find out what tickers lists are ready to be used as inputs for the pipeline.
+
+    Args:
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
     """
-    lines = ["# Available Ticker Universe Presets\n"]
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    presets: list[dict[str, object]] = []
     for p in UNIVERSE_PRESETS:
         ticker_count = 0
         if p.path and p.path.exists():
             try:
-                tickers = load_tickers(p.path)
-                ticker_count = len(tickers)
+                ticker_count = len(load_tickers(p.path))
             except Exception:
-                pass
-        lines.append(f"- **{p.key}** ({p.label}): {p.description} ({ticker_count} tickers)")
+                logger.exception("Failed to count tickers for preset %s", p.key)
+        presets.append(
+            {
+                "key": p.key,
+                "label": p.label,
+                "description": p.description,
+                "ticker_count": ticker_count,
+            }
+        )
+
+    if output_format == "json":
+        return json.dumps({"presets": presets}, ensure_ascii=False, indent=2)
+
+    lines = ["# Available Ticker Universe Presets\n"]
+    for item in presets:
+        lines.append(
+            f"- **{item['key']}** ({item['label']}): {item['description']} ({item['ticker_count']} tickers)"
+        )
     return "\n".join(lines)
 
 
 @mcp.tool()
-def get_universe_tickers(universe_key: str) -> str:
+def get_universe_tickers(universe_key: str, output_format: str = "markdown") -> str:
     """Return the list of tickers in a specific universe preset.
 
     Args:
         universe_key: The preset key (e.g., 'lq45', 'idx80', 'syariah').
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
     """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    def _payload(tickers: list[str], note: str = "") -> str:
+        if output_format == "json":
+            return json.dumps(
+                {"universe_key": universe_key, "count": len(tickers), "tickers": tickers, "note": note},
+                ensure_ascii=False,
+                indent=2,
+            )
+        if note and not tickers:
+            return note
+        return f"Tickers in {universe_key} ({len(tickers)}):\n" + ", ".join(tickers)
+
     if universe_key == "manual":
-        return "Manual mode: no preset tickers."
+        return _payload([], note="Manual mode: no preset tickers.")
     preset = [p for p in UNIVERSE_PRESETS if p.key == universe_key]
     if not preset:
         return f"Error: Universe preset '{universe_key}' not found."
@@ -715,27 +799,50 @@ def get_universe_tickers(universe_key: str) -> str:
     if p.path and p.path.exists():
         try:
             tickers = load_tickers(p.path)
+            if output_format == "json":
+                return _payload(tickers)
             return f"Tickers in {p.label} ({len(tickers)}):\n" + ", ".join(tickers)
         except Exception as e:
+            logger.exception("Failed to read preset file for %s", universe_key)
             return f"Error reading preset file: {e}"
     return f"Preset file for '{universe_key}' does not exist on disk."
 
 
 @mcp.tool()
-def list_pipeline_runs() -> str:
-    """Scan and list all historical and active pipeline runs on this machine.
+def list_pipeline_runs(limit: Optional[int] = None, output_format: str = "markdown") -> str:
+    """Scan and list historical and active pipeline runs on this machine.
 
     Shows the date, emiten count, closed trades, win rate, and report availability.
+
+    Args:
+        limit: Optional maximum number of most-recent runs to return. Use this to
+            keep the output compact when many runs exist. Must be between 1 and 200.
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
     """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    normalized_limit: int | None = None
+    if limit is not None:
+        try:
+            normalized_limit = int(limit)
+        except (TypeError, ValueError):
+            errors.append("limit must be an integer between 1 and 200.")
+        else:
+            if not 1 <= normalized_limit <= 200:
+                errors.append("limit must be an integer between 1 and 200.")
+    if errors:
+        return _validation_error(errors)
+
     try:
         run_dirs = discover_run_dirs(DEFAULT_RUN_ROOT)
+        if normalized_limit is not None:
+            run_dirs = run_dirs[:normalized_limit]
         if not run_dirs:
+            if output_format == "json":
+                return json.dumps({"run_count": 0, "runs": []}, ensure_ascii=False, indent=2)
             return "No pipeline runs found in the output directory."
 
-        lines = ["# Historical Pipeline Runs\n"]
-        lines.append("| Run ID | Formatted Date | Stage 1 Rows | Liquid Rows | Valid Plans | Win Rate | Report? | Error? |")
-        lines.append("|---|---|---|---|---|---|---|---|")
-
+        runs: list[dict[str, object]] = []
         for d in run_dirs:
             try:
                 info = summarize_run(d)
@@ -744,36 +851,61 @@ def list_pipeline_runs() -> str:
                     formatted_date = dt.strftime("%Y-%m-%d %H:%M:%S")
                 except ValueError:
                     formatted_date = "Unknown date"
-
-                win_rate_str = f"{info['win_rate'] * 100:.1f}%" if info.get("win_rate") is not None else "-"
-                report_str = "Yes" if info.get("report_available") else "No"
-                error_str = info.get("error", "-")
-
-                lines.append(
-                    f"| `{d.name}` | {formatted_date} | {info['stage1_rows']} | {info['liquid_rows']} | "
-                    f"{info['valid_trade_plans']} | {win_rate_str} | {report_str} | {error_str} |"
+                runs.append(
+                    {
+                        "run_id": d.name,
+                        "formatted_date": formatted_date,
+                        "stage1_rows": info.get("stage1_rows", 0),
+                        "liquid_rows": info.get("liquid_rows", 0),
+                        "valid_trade_plans": info.get("valid_trade_plans", 0),
+                        "win_rate": info.get("win_rate"),
+                        "report_available": bool(info.get("report_available")),
+                        "error": info.get("error", ""),
+                    }
                 )
             except Exception as e:
-                lines.append(f"| `{d.name}` | Error | - | - | - | - | - | {e} |")
+                logger.exception("Failed to summarize run %s", d.name)
+                runs.append({"run_id": d.name, "formatted_date": "Error", "error": str(e)})
 
+        if output_format == "json":
+            return json.dumps({"run_count": len(runs), "runs": runs}, ensure_ascii=False, indent=2)
+
+        lines = ["# Historical Pipeline Runs\n"]
+        lines.append("| Run ID | Formatted Date | Stage 1 Rows | Liquid Rows | Valid Plans | Win Rate | Report? | Error? |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for r in runs:
+            win_rate = r.get("win_rate")
+            win_rate_str = f"{win_rate * 100:.1f}%" if win_rate is not None else "-"
+            report_str = "Yes" if r.get("report_available") else "No"
+            lines.append(
+                f"| `{r['run_id']}` | {r.get('formatted_date', '-')} | {r.get('stage1_rows', '-')} | "
+                f"{r.get('liquid_rows', '-')} | {r.get('valid_trade_plans', '-')} | {win_rate_str} | "
+                f"{report_str} | {r.get('error') or '-'} |"
+            )
         return "\n".join(lines)
     except Exception as e:
+        logger.exception("Failed to scan runs")
         return f"Failed to scan runs: {e}"
 
 
 @mcp.tool()
-def get_run_details(run_id: str) -> str:
+def get_run_details(run_id: str, output_format: str = "markdown") -> str:
     """Return stage availability and detailed summary metrics for a specific run.
 
     Args:
         run_id: The run identifier (e.g. '20260706_210737').
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
     """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
     run_dir = DEFAULT_RUN_ROOT / run_id
     if not run_dir.exists():
         return f"Error: Run directory '{run_id}' not found."
 
     available_stages = {}
-    from interday_liquidity_screener.pipeline import STAGE_FILES
     for stage, filename in STAGE_FILES.items():
         if stage.startswith("stage3a_"):
             p = run_dir / "stockbit" / filename
@@ -785,17 +917,36 @@ def get_run_details(run_id: str) -> str:
         summary = summarize_run(run_dir)
         dt = datetime.strptime(run_id, "%Y%m%d_%H%M%S")
         formatted_date = dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception as e:
+    except Exception:
+        logger.exception("Failed to summarize run %s", run_id)
         summary = {}
         formatted_date = "Error parsing run ID"
 
+    win_rate = summary.get("win_rate")
+
+    if output_format == "json":
+        return json.dumps(
+            {
+                "run_id": run_id,
+                "formatted_date": formatted_date,
+                "stage1_rows": summary.get("stage1_rows", 0),
+                "stage2_rows": summary.get("stage2_rows", 0),
+                "valid_trade_plans": summary.get("valid_trade_plans", 0),
+                "win_rate": win_rate,
+                "report_available": bool(summary.get("report_available", False)),
+                "error": summary.get("error", ""),
+                "stage_files": available_stages,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    win_rate_str = f"{win_rate * 100:.1f}%" if win_rate is not None else "-"
     lines = [f"# Run Details: {run_id}"]
     lines.append(f"- **Execution Date**: {formatted_date}")
     lines.append(f"- **Stage 1 (Liquidity Screen)**: {summary.get('stage1_rows', 0)} rows")
     lines.append(f"- **Stage 2 (Technical Screen)**: {summary.get('stage2_rows', 0)} rows")
     lines.append(f"- **Stage 4 (Actionable Plans)**: {summary.get('valid_trade_plans', 0)} plans")
-    win_rate = summary.get("win_rate")
-    win_rate_str = f"{win_rate * 100:.1f}%" if win_rate is not None else "-"
     lines.append(f"- **Backtest Win Rate**: {win_rate_str}")
     lines.append(f"- **AI Report Available**: {summary.get('report_available', False)}")
     if summary.get("error"):
@@ -812,7 +963,8 @@ def get_run_details(run_id: str) -> str:
 def get_watchlist_results(
     run_id: str,
     status_filter: Optional[str] = None,
-    limit: int = 20
+    limit: int = 20,
+    output_format: str = "markdown",
 ) -> str:
     """Load, filter, and return rows from the hybrid watchlist output (hybrid_watchlist.csv) for a run.
 
@@ -823,7 +975,13 @@ def get_watchlist_results(
         status_filter: Optional status to filter by (e.g. 'EXECUTION_READY', 'NEED_ORDERBOOK', 'SKIP').
                        References the WatchlistStatus enum.
         limit: Max candidates to return (defaults to 20).
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
     """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
     run_dir = DEFAULT_RUN_ROOT / run_id
     if not run_dir.exists():
         return f"Error: Run ID '{run_id}' not found."
@@ -835,9 +993,12 @@ def get_watchlist_results(
     try:
         df = pd.read_csv(path)
     except Exception as e:
+        logger.exception("Failed to load watchlist CSV for %s", run_id)
         return f"Error loading CSV: {e}"
 
     if df.empty:
+        if output_format == "json":
+            return json.dumps({"run_id": run_id, "count": 0, "candidates": []}, ensure_ascii=False, indent=2)
         return "The watchlist for this run is empty."
 
     df = df.fillna("")
@@ -846,6 +1007,12 @@ def get_watchlist_results(
         if "final_status" in df.columns:
             df = df[df["final_status"] == status_filter]
             if df.empty:
+                if output_format == "json":
+                    return json.dumps(
+                        {"run_id": run_id, "status_filter": status_filter, "count": 0, "candidates": []},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
                 return f"No candidates found matching status filter: '{status_filter}'"
         else:
             return "Error: 'final_status' column missing in watchlist."
@@ -857,6 +1024,17 @@ def get_watchlist_results(
         df = df.sort_values(by="final_score", ascending=False)
 
     df_subset = df.head(limit)
+
+    if output_format == "json":
+        cols = ["symbol", "name", "final_status", "final_score", "rank", "entry_price", "tp1_price", "stop_loss_price", "position_value"]
+        actual_cols = [c for c in cols if c in df_subset.columns]
+        records = df_subset[actual_cols].to_dict(orient="records") if actual_cols else df_subset.to_dict(orient="records")
+        return json.dumps(
+            {"run_id": run_id, "status_filter": status_filter, "count": len(records), "candidates": records},
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
 
     lines = [f"# Watchlist Candidates for Run: {run_id}"]
     if status_filter:
@@ -1182,14 +1360,21 @@ def run_morning_confirmation(
 
 
 @mcp.tool()
-def get_ai_report(run_id: str) -> str:
+def get_ai_report(run_id: str, output_format: str = "markdown") -> str:
     """Load and return the full markdown text of the Stage 6 LLM analyst report for a run.
 
     Provides the investment thesis, evidence summary, and ranking narrative.
 
     Args:
         run_id: The run ID.
+        output_format: ``markdown`` for the raw report or ``json`` for an
+            ``{"run_id", "report"}`` envelope that is easier for agents to parse.
     """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
     run_dir = DEFAULT_RUN_ROOT / run_id
     if not run_dir.exists():
         return f"Error: Run directory '{run_id}' not found."
@@ -1200,9 +1385,38 @@ def get_ai_report(run_id: str) -> str:
 
     try:
         content = path.read_text(encoding="utf-8")
-        return content
     except Exception as e:
+        logger.exception("Failed to read AI report for %s", run_id)
         return f"Error reading report: {e}"
+
+    if output_format == "json":
+        return json.dumps({"run_id": run_id, "report": content}, ensure_ascii=False, indent=2)
+    return content
+
+
+def _prune_mcp_ticker_files(keep: int = MCP_TICKER_FILE_KEEP, current: Path | None = None) -> None:
+    """Best-effort housekeeping: keep only the newest MCP ticker input files.
+
+    ``run_trading_pipeline`` writes one ``mcp_tickers_<run_id>.txt`` per scan.
+    Without pruning ``data/input`` grows without bound. This never deletes the
+    file for the current run and swallows any I/O error so housekeeping can
+    never break an otherwise successful pipeline call.
+    """
+    try:
+        files = sorted(
+            DEFAULT_INPUT_ROOT.glob("mcp_tickers_*.txt"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in files[keep:]:
+            if current is not None and stale == current:
+                continue
+            try:
+                stale.unlink()
+            except OSError:
+                logger.debug("Could not prune stale ticker file %s", stale)
+    except Exception:
+        logger.debug("Ticker file pruning skipped due to an unexpected error", exc_info=True)
 
 
 def _existing_resume_ticker_file(run_id: str) -> Path | None:
@@ -1326,6 +1540,9 @@ def run_trading_pipeline(
     ticker_file_path.parent.mkdir(parents=True, exist_ok=True)
     ticker_file_path.write_text("\n".join(tickers_list) + "\n", encoding="utf-8")
 
+    if not resume_run_id:
+        _prune_mcp_ticker_files(current=ticker_file_path)
+
     # 3. Bangun PipelineOptions
     options = PipelineOptions(
         tickers_file=ticker_file_path,
@@ -1406,17 +1623,24 @@ def scan_bandar_activity(
     output_path: str = "data/output/bandar_scan_results.csv",
     force_refresh: bool = False,
     investor_type: str | None = None,
-    period: str | None = None
+    period: str | None = None,
+    output_format: str = "markdown",
 ) -> str:
     """Scan and track smart money (bandar) accumulation flow for target brokers on Stockbit.
-    
+
     Args:
         config_path: Path to tracker JSON config.
         output_path: Path to write results CSV.
         force_refresh: Set to True to bypass daily cache and force live fetch.
         investor_type: Optional override (e.g. 'INVESTOR_TYPE_FOREIGN', 'INVESTOR_TYPE_DOMESTIC').
         period: Optional override (e.g. 'RT_PERIOD_LAST_7_DAYS', 'RT_PERIOD_LAST_3_DAYS').
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
     """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
     from interday_liquidity_screener.bandar_tracker import run_bandar_scan
     try:
         df = run_bandar_scan(
@@ -1426,31 +1650,51 @@ def scan_bandar_activity(
             override_investor_type=investor_type,
             override_period=period
         )
-        if df.empty:
-            return "No accumulated tickers found or error occurred."
-            
-        return _df_to_markdown_manual(df)
     except Exception as e:
+        logger.exception("Error running bandar scan")
         return f"Error running bandar scan: {e}"
+
+    if df.empty:
+        if output_format == "json":
+            return json.dumps({"count": 0, "tickers": []}, ensure_ascii=False, indent=2)
+        return "No accumulated tickers found or error occurred."
+
+    if output_format == "json":
+        records = df.to_dict(orient="records")
+        return json.dumps({"count": len(records), "tickers": records}, ensure_ascii=False, indent=2, default=str)
+    return _df_to_markdown_manual(df)
 
 
 @mcp.tool()
-def get_commodity_prices(force_refresh: bool = False) -> str:
-    """Return live global commodities prices and daily changes as a Markdown table.
-    
+def get_commodity_prices(force_refresh: bool = False, output_format: str = "markdown") -> str:
+    """Return live global commodities prices and daily changes.
+
     Args:
         force_refresh: Set to True to bypass daily cache and force live fetch.
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
     """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
     from interday_liquidity_screener.commodity_gate import fetch_live_commodities
-    import pandas as pd
     try:
         commodities = fetch_live_commodities(force_refresh=force_refresh)
-        if not commodities:
-            return "No commodity data retrieved."
-        df = pd.DataFrame(list(commodities.values()))
-        return _df_to_markdown_manual(df)
     except Exception as e:
+        logger.exception("Error retrieving commodity prices")
         return f"Error retrieving commodity prices: {e}"
+
+    if not commodities:
+        if output_format == "json":
+            return json.dumps({"count": 0, "commodities": []}, ensure_ascii=False, indent=2)
+        return "No commodity data retrieved."
+
+    values = list(commodities.values())
+    if output_format == "json":
+        return json.dumps({"count": len(values), "commodities": values}, ensure_ascii=False, indent=2, default=str)
+    df = pd.DataFrame(values)
+    return _df_to_markdown_manual(df)
 
 @mcp.tool()
 def get_ticker_stage_details(
@@ -1519,7 +1763,6 @@ def get_ticker_stage_details(
         return None
 
     stages_data = {}
-    from interday_liquidity_screener.pipeline import STAGE_FILES
 
     # 1. Stage 1 - Liquidity
     stage1_path = run_dir / STAGE_FILES["stage1"]
@@ -1846,6 +2089,304 @@ def get_live_monitor_status() -> str:
         return json.dumps(parsed, indent=2)
     except Exception as e:
         return f"Error reading live monitor status: {e}"
+
+
+def _job_snapshot(job: dict[str, object]) -> dict[str, object]:
+    """Return a JSON-safe copy of a background job record."""
+    return {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "run_id": job.get("run_id"),
+        "run_phase": job.get("run_phase"),
+        "universe_key": job.get("universe_key"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "result": job.get("result"),
+        "error": job.get("error"),
+    }
+
+
+def _run_pipeline_job(job_id: str, kwargs: dict[str, object]) -> None:
+    """Worker body executed on a background thread for start_pipeline_run."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job["status"] = "RUNNING"
+            job["started_at"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        result = run_trading_pipeline(**kwargs)  # type: ignore[arg-type]
+        run_id = kwargs.get("resume_run_id")
+        if not run_id:
+            import re
+
+            match = re.search(r"(\d{8}_\d{6})", result)
+            run_id = match.group(1) if match else None
+        failed = result.startswith("Error") or "completed with failures" in result
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            if job is not None:
+                job["status"] = "FAILED" if failed else "SUCCEEDED"
+                job["result"] = result
+                job["run_id"] = run_id
+                job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    except Exception as exc:  # pragma: no cover - defensive worker guard
+        logger.exception("Background pipeline job %s crashed", job_id)
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            if job is not None:
+                job["status"] = "FAILED"
+                job["error"] = f"{exc}\n{traceback.format_exc()}"
+                job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+@mcp.tool()
+def start_pipeline_run(
+    tickers: Optional[str] = None,
+    universe_key: str = "lq45",
+    strategy_mode: str = "interday",
+    capital: float = 1_000_000.0,
+    risk_per_trade_pct: float = 0.005,
+    max_position_pct: float = 0.20,
+    run_phase: str = "malam",
+    resume_run_id: Optional[str] = None,
+    enable_market_regime: bool = False,
+    enable_multibar_confirm: bool = False,
+    enable_adaptive_tp: bool = False,
+    enable_liquidity_sizer: bool = False,
+    enable_blackout: bool = False,
+    output_format: str = "markdown",
+) -> str:
+    """Start a pipeline scan in the background and return a job_id immediately.
+
+    This is the non-blocking counterpart to ``run_trading_pipeline``. The full
+    scan can take many minutes; instead of blocking the agent, this returns
+    right away with a ``job_id``. Poll ``get_pipeline_run_status(job_id)`` for
+    progress and the final ``run_id``. Inputs are validated synchronously so
+    invalid parameters are reported before any background work starts.
+
+    Args mirror ``run_trading_pipeline``. See that tool for details.
+    """
+    errors: list[str] = []
+    normalized_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    _, _, _, _, _, validation_error = _validate_pipeline_inputs(
+        strategy_mode,
+        capital,
+        risk_per_trade_pct,
+        max_position_pct,
+        run_phase,
+    )
+    if validation_error:
+        return validation_error
+
+    kwargs = {
+        "tickers": tickers,
+        "universe_key": universe_key,
+        "strategy_mode": strategy_mode,
+        "capital": capital,
+        "risk_per_trade_pct": risk_per_trade_pct,
+        "max_position_pct": max_position_pct,
+        "run_phase": run_phase,
+        "resume_run_id": resume_run_id,
+        "enable_market_regime": enable_market_regime,
+        "enable_multibar_confirm": enable_multibar_confirm,
+        "enable_adaptive_tp": enable_adaptive_tp,
+        "enable_liquidity_sizer": enable_liquidity_sizer,
+        "enable_blackout": enable_blackout,
+    }
+
+    job_id = uuid.uuid4().hex[:12]
+    record = {
+        "job_id": job_id,
+        "status": "PENDING",
+        "run_id": resume_run_id,
+        "run_phase": run_phase,
+        "universe_key": universe_key,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "started_at": None,
+        "finished_at": None,
+        "result": None,
+        "error": None,
+    }
+    with _JOBS_LOCK:
+        _JOBS[job_id] = record
+
+    thread = threading.Thread(target=_run_pipeline_job, args=(job_id, kwargs), daemon=True)
+    thread.start()
+
+    if normalized_format == "json":
+        with _JOBS_LOCK:
+            return json.dumps(_job_snapshot(_JOBS[job_id]), ensure_ascii=False, indent=2)
+    return (
+        f"Started background pipeline job **{job_id}** (phase: {run_phase}, universe: {universe_key}).\n"
+        f"Poll progress with: `get_pipeline_run_status('{job_id}')`."
+    )
+
+
+@mcp.tool()
+def get_pipeline_run_status(job_id: str, output_format: str = "markdown") -> str:
+    """Return the status of a background job started by ``start_pipeline_run``.
+
+    Args:
+        job_id: The identifier returned by ``start_pipeline_run``.
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        snapshot = _job_snapshot(job) if job is not None else None
+
+    if snapshot is None:
+        if output_format == "json":
+            return json.dumps({"job_id": job_id, "status": "NOT_FOUND"}, ensure_ascii=False, indent=2)
+        return f"Error: No background pipeline job found with id '{job_id}'."
+
+    if output_format == "json":
+        return json.dumps(snapshot, ensure_ascii=False, indent=2)
+
+    lines = [
+        f"# Pipeline Job: {snapshot['job_id']}",
+        f"- **Status**: {snapshot['status']}",
+        f"- **Run ID**: {snapshot['run_id'] or '-'}",
+        f"- **Phase / Universe**: {snapshot['run_phase']} / {snapshot['universe_key']}",
+        f"- **Created / Started / Finished**: {snapshot['created_at']} / {snapshot['started_at'] or '-'} / {snapshot['finished_at'] or '-'}",
+    ]
+    if snapshot["status"] in {"SUCCEEDED", "FAILED"} and snapshot.get("result"):
+        lines.extend(["", "## Result", str(snapshot["result"])])
+    if snapshot.get("error"):
+        lines.extend(["", "## Error", str(snapshot["error"])])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_run_bundle(
+    run_id: str,
+    capital: float = 1_000_000.0,
+    max_tp_pct: float = 0.05,
+    max_position_pct: float = 1.0,
+    limit: int = 5,
+    output_format: str = "markdown",
+) -> str:
+    """Return a one-shot bundle for a run: summary, audit, watchlist, and recommendation.
+
+    This aggregates ``get_run_details``, ``get_run_audit``, ``get_watchlist_results``,
+    and ``get_trade_recommendation`` in a single call so an agent does not need
+    four round trips to reach an execution review. It is read-only and does not
+    create new signals.
+
+    Args:
+        run_id: Pipeline run ID that contains ``hybrid_watchlist.csv``.
+        capital: Available capital in IDR used for position sizing context.
+        max_tp_pct: Portfolio net-profit target as a fraction of capital.
+        max_position_pct: Maximum capital allocation for a single candidate.
+        limit: Maximum shortlist rows to include.
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
+    """
+    capital, max_tp_pct, max_position_pct, limit, output_format, validation_error = _validate_recommendation_inputs(
+        capital,
+        max_tp_pct,
+        max_position_pct=max_position_pct,
+        limit=limit,
+        output_format=output_format,
+    )
+    if validation_error:
+        return validation_error
+
+    run_dir = DEFAULT_RUN_ROOT / run_id
+    if not run_dir.exists():
+        return f"Error: Run ID '{run_id}' not found."
+
+    effective_limit = limit or 5
+
+    try:
+        summary = summarize_run(run_dir)
+    except Exception:
+        logger.exception("Failed to summarize run %s for bundle", run_id)
+        summary = {}
+
+    audit_report = build_run_audit_report(
+        run_dir,
+        resolve_artifact_path=resolve_artifact_path,
+        summarize_run=summarize_run,
+        capital=capital,
+        max_tp_pct=max_tp_pct,
+        max_position_pct=max_position_pct,
+    )
+
+    pack, pack_error = _load_recommendation_pack(
+        run_id=run_id,
+        capital=capital,
+        max_tp_pct=max_tp_pct,
+        max_position_pct=max_position_pct,
+        limit=effective_limit,
+    )
+
+    if output_format == "json":
+        bundle = {
+            "run_id": run_id,
+            "summary": summary,
+            "audit": audit_report.to_dict(),
+            "recommendation": None if pack is None else pack.to_dict(),
+            "recommendation_error": pack_error,
+        }
+        return json.dumps(bundle, ensure_ascii=False, indent=2, default=str)
+
+    sections = [
+        f"# Run Bundle: {run_id}",
+        "",
+        "## Audit",
+        render_run_audit_markdown(audit_report),
+        "",
+        "## Recommendation",
+        pack_error if pack is None else render_recommendation_markdown(pack),
+    ]
+    return "\n".join(sections)
+
+
+@mcp.resource("mcp://capabilities")
+def capabilities_resource() -> str:
+    """Expose the MCP capability manifest as a cacheable JSON resource."""
+    return json.dumps(_capabilities_payload(), ensure_ascii=False, indent=2)
+
+
+@mcp.resource("mcp://recommendation-policy")
+def recommendation_policy_resource() -> str:
+    """Expose the active recommendation policy as a cacheable JSON resource."""
+    return json.dumps(_recommendation_policy_payload(), ensure_ascii=False, indent=2)
+
+
+@mcp.resource("mcp://workflow")
+def workflow_resource() -> str:
+    """Expose the professional trading workflow guide as a cacheable resource."""
+    doc_path = package_root / "docs" / "mcp_professional_workflow.md"
+    if doc_path.exists():
+        try:
+            return doc_path.read_text(encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to read workflow document")
+    return "\n".join(str(step) for step in _capabilities_payload()["recommended_workflow"])
+
+
+@mcp.prompt()
+def evening_scan_workflow(universe_key: str = "lq45", capital: float = 1_000_000.0) -> str:
+    """Prompt template guiding the malam -> pagi professional scan workflow."""
+    return (
+        "You are operating the IDX Interday Trading MCP server. Follow this order:\n"
+        "1. Call get_system_health to confirm preflight is OK.\n"
+        f"2. Start the evening scan with start_pipeline_run(universe_key='{universe_key}', "
+        f"capital={capital:.0f}, run_phase='malam') and poll get_pipeline_run_status.\n"
+        "3. When the job succeeds, call get_run_bundle(run_id) to review audit, watchlist, and recommendation together.\n"
+        "4. On market morning, call run_morning_confirmation(resume_run_id=run_id) for live orderbook confirmation.\n"
+        "5. Re-check get_trade_recommendation before any manual execution decision.\n"
+        "Remember: this server is decision support only and never places orders."
+    )
 
 
 def main() -> None:

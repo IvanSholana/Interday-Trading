@@ -6,7 +6,13 @@ capital-aware shortlist. It does not place orders and does not guarantee profit.
 
 ## Recommended Flow
 
-1. Run the evening scan with `run_trading_pipeline`.
+1. Run the evening scan.
+   - Blocking: `run_trading_pipeline` runs synchronously and returns when the
+     scan finishes.
+   - Non-blocking: `start_pipeline_run` returns a `job_id` immediately and runs
+     the scan on a background thread. Poll `get_pipeline_run_status(job_id)`
+     until the status is `SUCCEEDED` or `FAILED`. Prefer this for long scans so
+     the agent stays responsive.
    - Use `run_phase="malam"` to skip live orderbook checks.
    - Enable the P1-P5 safety modules unless doing a controlled experiment.
    - Use the actual capital and risk settings, not placeholders.
@@ -21,11 +27,21 @@ capital-aware shortlist. It does not place orders and does not guarantee profit.
    - Use `output_format="markdown"` for human review.
    - Use `output_format="json"` for agent workflows.
    - Pass `max_tp_pct` when the user has a hard TP constraint.
+   - Shortcut: `get_run_bundle(run_id)` returns the audit, watchlist, and
+     recommendation in one call to avoid extra round trips.
 
 4. Run `run_morning_confirmation` before market execution.
    - This resumes the evening run and executes Stage 3C orderbook confirmation.
    - Re-check recommendation output after the morning run.
    - Do not chase opening gaps beyond the planned entry zone.
+
+## Output Formats & Resources
+
+- Every inspection and decision-support tool accepts `output_format="json"` for
+  structured agent parsing or `output_format="markdown"` for human review.
+- Static context is also exposed as cacheable MCP resources: `mcp://capabilities`,
+  `mcp://recommendation-policy`, and `mcp://workflow`.
+- The `evening_scan_workflow` prompt returns a ready-made malam -> pagi playbook.
 
 ## Decision Grades
 

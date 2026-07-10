@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -9,6 +9,11 @@ import pandas as pd
 
 DEFAULT_MARKET_DATA_DB = Path("data/cache/market_data.sqlite")
 OHLCV_COLUMNS = ["open", "high", "low", "close", "adjusted_close", "volume"]
+
+# IDX market closes at 16:15 WIB (UTC+7). We add a 15-minute buffer to be safe.
+_IDX_MARKET_CLOSE_HOUR_WIB = 16
+_IDX_MARKET_CLOSE_MINUTE_WIB = 30  # 16:15 + 15 min buffer = 16:30
+_WIB = timezone(timedelta(hours=7))
 
 
 def normalize_ohlcv_frame(data: pd.DataFrame | None, ticker: str | None = None) -> pd.DataFrame:
@@ -139,6 +144,20 @@ class MarketDataCache:
             return None, None
         return date.fromisoformat(row[0]), date.fromisoformat(row[1])
 
+    def last_bar_updated_at(self, ticker: str, bar_date: date, interval: str = "1d") -> datetime | None:
+        """Return the updated_at timestamp (UTC) for a specific bar, or None."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT updated_at FROM ohlcv WHERE ticker = ? AND interval = ? AND date = ?",
+                (ticker, interval, bar_date.isoformat()),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return datetime.fromisoformat(row[0])
+        except (ValueError, TypeError):
+            return None
+
     def save_ohlcv(self, ticker: str, data: pd.DataFrame, interval: str = "1d") -> int:
         normalized = normalize_ohlcv_frame(data, ticker)
         if normalized.empty:
@@ -210,6 +229,35 @@ def download_yfinance_ohlcv(
     return yf.download(**kwargs)
 
 
+def _today_bar_is_stale(cache: MarketDataCache, ticker: str, today: date, interval: str = "1d") -> bool:
+    """Return True if the cached bar for *today* was written before IDX market close.
+
+    This detects the common case where yfinance returned a partial intraday bar
+    early in the day (or even pre-market) and the cache still holds that stale
+    snapshot when the pipeline runs in the evening.
+
+    A bar is NOT considered stale if it was written very recently (within the
+    last 60 seconds) because that means it was just fetched in this session.
+    """
+    updated = cache.last_bar_updated_at(ticker, today, interval)
+    if updated is None:
+        return False  # no bar yet — will be fetched fresh anyway
+    # updated_at is stored via sqlite CURRENT_TIMESTAMP which is UTC.
+    # Convert the comparison threshold to UTC as well.
+    from datetime import timezone as tz
+    now_utc = datetime.now(tz.utc).replace(tzinfo=None)
+    naive_updated = updated.replace(tzinfo=None) if updated.tzinfo else updated
+    # If bar was written in the last 60 seconds, it was just fetched — not stale.
+    if (now_utc - naive_updated).total_seconds() < 60:
+        return False
+    # IDX market closes at 16:30 WIB = 09:30 UTC.
+    close_threshold_utc = datetime(
+        today.year, today.month, today.day,
+        _IDX_MARKET_CLOSE_HOUR_WIB - 7, _IDX_MARKET_CLOSE_MINUTE_WIB,
+    )
+    return naive_updated < close_threshold_utc
+
+
 def get_incremental_ohlcv(
     ticker: str,
     period: str,
@@ -235,6 +283,10 @@ def get_incremental_ohlcv(
         if next_date <= today:
             fetched = download_yfinance_ohlcv(ticker, interval=interval, start=next_date, end=end_date, threads=False)
             cache.save_ohlcv(ticker, fetched, interval)
+        elif last_cached == today and _today_bar_is_stale(cache, ticker, today, interval):
+            # Bar for today exists but was cached before market close — re-fetch.
+            fetched = download_yfinance_ohlcv(ticker, interval=interval, start=today, end=end_date, threads=False)
+            cache.save_ohlcv(ticker, fetched, interval)
 
     return cache.load_ohlcv(ticker, interval, start_date=required_start)
 
@@ -253,6 +305,7 @@ def get_incremental_ohlcv_batch(
     required_start = period_start_date(period, today)
     stale_full: list[str] = []
     stale_incremental: dict[date, list[str]] = {}
+    stale_today: list[str] = []
 
     for ticker in tickers:
         first_cached, last_cached = cache.coverage(ticker, interval)
@@ -260,6 +313,8 @@ def get_incremental_ohlcv_batch(
             stale_full.append(ticker)
         elif last_cached is not None and last_cached < today:
             stale_incremental.setdefault(last_cached + timedelta(days=1), []).append(ticker)
+        elif last_cached == today and _today_bar_is_stale(cache, ticker, today, interval):
+            stale_today.append(ticker)
 
     _fetch_and_store_batches(cache, stale_full, period, interval, batch_size)
     for start_date, stale_tickers in stale_incremental.items():
@@ -270,6 +325,16 @@ def get_incremental_ohlcv_batch(
             interval,
             batch_size,
             start=start_date,
+            end=today + timedelta(days=1),
+        )
+    if stale_today:
+        _fetch_and_store_batches(
+            cache,
+            stale_today,
+            period,
+            interval,
+            batch_size,
+            start=today,
             end=today + timedelta(days=1),
         )
 

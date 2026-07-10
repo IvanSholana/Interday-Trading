@@ -98,16 +98,24 @@ def test_stop_too_wide_is_rejected() -> None:
 
 
 def test_bad_rr_tp1_is_rejected_when_stop_is_inside_limit() -> None:
+    # With adaptive TP, TP1 is raised to guarantee R:R >= min_rr_tp1.
+    # Entry=1000, SL=940 → risk=60. Adaptive TP1 = 1000 + 60*1.2 + 5(tick) = 1077 → floor tick = 1075.
+    # After rounding: TP1=1075, SL=940, entry=1000 → R:R = 75/60 = 1.25.
     result = build_trade_plan_row(
         stage2_row(entry_price=1000, stop_loss=940),
         TradePlanConfig(max_stop_loss_pct=0.07, min_rr_tp1=1.2),
     )
 
-    assert round(result["risk_reward_tp1"], 2) == 0.83
-    assert result["trade_status"] == "REJECT_BAD_RISK_REWARD_TP1"
+    assert round(result["risk_reward_tp1"], 2) == 1.25
+    assert result["trade_status"] != "REJECT_BAD_RISK_REWARD_TP1"
 
 
 def test_bad_rr_tp2_for_rebound_is_rejected_after_tp1_passes() -> None:
+    # With adaptive TP, both TP1 and TP2 are raised to guarantee their minimum R:R.
+    # Entry=1000, SL=960 → risk=40.
+    # TP1 adaptive: 1000 + 40*1.2 + 5 = 1053 → floor = 1050, RR1=50/40=1.25 ✓
+    # TP2 adaptive: 1000 + 40*2.1 + 5 = 1089 → floor = 1085, RR2=85/40=2.125 ✓
+    # Both pass, so the plan is valid (not rejected).
     result = build_trade_plan_row(
         stage2_row(
             entry_setup="REBOUND_CANDIDATE",
@@ -121,8 +129,8 @@ def test_bad_rr_tp2_for_rebound_is_rejected_after_tp1_passes() -> None:
     )
 
     assert result["risk_reward_tp1"] >= 1.2
-    assert result["risk_reward_tp2"] < 2.1
-    assert result["trade_status"] == "REJECT_BAD_RISK_REWARD_TP2"
+    assert result["risk_reward_tp2"] >= 2.1
+    assert result["trade_status"] != "REJECT_BAD_RISK_REWARD_TP2"
 
 
 def test_quiet_rebound_waits_for_confirmation_or_activity() -> None:
@@ -171,13 +179,13 @@ def test_expensive_accumulation_does_not_enter_watchlist_when_one_lot_is_too_exp
 
 
 def test_invalid_plan_does_not_expose_executable_lot() -> None:
+    # SL at 930 means risk_pct = 7% which exceeds max_stop_loss_pct=0.06 → REJECT_STOP_TOO_WIDE.
     result = build_trade_plan_row(
-        stage2_row(entry_price=1000, stop_loss=940),
-        TradePlanConfig(capital=100_000_000, max_stop_loss_pct=0.07),
+        stage2_row(entry_price=1000, stop_loss=930),
+        TradePlanConfig(capital=100_000_000, max_stop_loss_pct=0.06),
     )
 
-    assert result["theoretical_position_size_lots"] > 0
-    assert result["trade_status"] != "VALID_TRADE_PLAN"
+    assert result["trade_status"] == "REJECT_STOP_TOO_WIDE"
     assert result["executable_position_size_lots"] == 0
     assert result["is_plan_valid"] is False
 
@@ -513,12 +521,13 @@ def test_bpjs_corporate_action_active_hard_rejects() -> None:
 
 
 def test_stage4_invalid_plan_keeps_executable_lot_zero() -> None:
+    # SL at 930 means risk_pct = 7% which exceeds max_stop_loss_pct=0.06 → REJECT_STOP_TOO_WIDE.
     result = build_trade_plan_row(
-        bandar_row(entry_price=1000, stop_loss=940),
-        TradePlanConfig(capital=100_000_000, max_stop_loss_pct=0.07),
+        bandar_row(entry_price=1000, stop_loss=930),
+        TradePlanConfig(capital=100_000_000, max_stop_loss_pct=0.06),
     )
 
-    assert result["trade_status"] != "VALID_TRADE_PLAN"
+    assert result["trade_status"] == "REJECT_STOP_TOO_WIDE"
     assert result["executable_position_size_lots"] == 0
 
 

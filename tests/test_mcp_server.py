@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import time
 import types
 import json
 from types import SimpleNamespace
@@ -16,6 +17,18 @@ class _FakeFastMCP:
         self.name = name
 
     def tool(self):
+        def decorator(func):
+            return func
+
+        return decorator
+
+    def resource(self, *args, **kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
+    def prompt(self, *args, **kwargs):
         def decorator(func):
             return func
 
@@ -716,3 +729,208 @@ def test_get_ticker_stage_details(tmp_path, monkeypatch) -> None:
     
     res_md_missing = mcp_server.get_ticker_stage_details(run_id, "TLKM")
     assert "Ticker not present in Stage 1" in res_md_missing
+
+
+# ---------------------------------------------------------------------------
+# Tests for the JSON output / non-blocking / bundle enhancements.
+# ---------------------------------------------------------------------------
+
+
+def _write_hybrid_watchlist(run_dir) -> None:
+    pd.DataFrame(
+        [
+            {
+                "symbol": "PGEO",
+                "name": "PGEO",
+                "final_status": WatchlistStatus.EXECUTION_DRAFT.value,
+                "final_score": 92.2,
+                "rank": 1,
+                "entry_price": 940,
+                "tp1_price": 955,
+                "stop_loss_price": 930,
+                "position_value": 940_000,
+            }
+        ]
+    ).to_csv(run_dir / "hybrid_watchlist.csv", index=False)
+
+
+def test_get_presets_info_json(monkeypatch, tmp_path) -> None:
+    preset_file = tmp_path / "lq45.txt"
+    preset_file.write_text("BBCA\nTLKM\n", encoding="utf-8")
+    monkeypatch.setattr(
+        mcp_server,
+        "UNIVERSE_PRESETS",
+        [SimpleNamespace(key="lq45", label="LQ45", description="Liquid", path=preset_file)],
+    )
+
+    payload = json.loads(mcp_server.get_presets_info(output_format="json"))
+
+    assert payload["presets"][0]["key"] == "lq45"
+    assert payload["presets"][0]["ticker_count"] == 2
+
+
+def test_get_presets_info_rejects_invalid_output_format() -> None:
+    result = mcp_server.get_presets_info(output_format="xml")
+    assert result.startswith("Error: Invalid MCP input.")
+
+
+def test_get_universe_tickers_json(monkeypatch, tmp_path) -> None:
+    preset_file = tmp_path / "lq45.txt"
+    preset_file.write_text("BBCA\nTLKM\n", encoding="utf-8")
+    monkeypatch.setattr(
+        mcp_server,
+        "UNIVERSE_PRESETS",
+        [SimpleNamespace(key="lq45", label="LQ45", description="Liquid", path=preset_file)],
+    )
+
+    payload = json.loads(mcp_server.get_universe_tickers("lq45", output_format="json"))
+
+    assert payload["universe_key"] == "lq45"
+    assert payload["count"] == 2
+    assert "BBCA.JK" in payload["tickers"] or "BBCA" in payload["tickers"]
+
+
+def test_list_pipeline_runs_json_and_limit(monkeypatch, tmp_path) -> None:
+    run_root = tmp_path / "runs"
+    for name in ("20260708_201500", "20260708_202500"):
+        (run_root / name).mkdir(parents=True)
+    monkeypatch.setattr(mcp_server, "DEFAULT_RUN_ROOT", run_root)
+    monkeypatch.setattr(
+        mcp_server,
+        "discover_run_dirs",
+        lambda root: sorted(run_root.iterdir(), key=lambda p: p.name, reverse=True),
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "summarize_run",
+        lambda d: {"stage1_rows": 5, "liquid_rows": 4, "valid_trade_plans": 0, "win_rate": None, "report_available": True},
+    )
+
+    payload = json.loads(mcp_server.list_pipeline_runs(limit=1, output_format="json"))
+
+    assert payload["run_count"] == 1
+    assert payload["runs"][0]["report_available"] is True
+
+
+def test_list_pipeline_runs_rejects_bad_limit() -> None:
+    result = mcp_server.list_pipeline_runs(limit=0)
+    assert result.startswith("Error: Invalid MCP input.")
+    assert "limit must be an integer between 1 and 200." in result
+
+
+def test_get_run_details_json(monkeypatch, tmp_path) -> None:
+    run_root = tmp_path / "runs"
+    run_dir = run_root / "20260708_201500"
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(mcp_server, "DEFAULT_RUN_ROOT", run_root)
+    monkeypatch.setattr(
+        mcp_server,
+        "summarize_run",
+        lambda d: {"stage1_rows": 10, "stage2_rows": 8, "valid_trade_plans": 2, "win_rate": 0.5, "report_available": True},
+    )
+
+    payload = json.loads(mcp_server.get_run_details("20260708_201500", output_format="json"))
+
+    assert payload["run_id"] == "20260708_201500"
+    assert payload["stage1_rows"] == 10
+    assert "stage_files" in payload
+
+
+def test_get_watchlist_results_json(monkeypatch, tmp_path) -> None:
+    run_root = tmp_path / "runs"
+    run_dir = run_root / "20260708_205047"
+    run_dir.mkdir(parents=True)
+    _write_hybrid_watchlist(run_dir)
+    monkeypatch.setattr(mcp_server, "DEFAULT_RUN_ROOT", run_root)
+
+    payload = json.loads(mcp_server.get_watchlist_results("20260708_205047", output_format="json"))
+
+    assert payload["count"] == 1
+    assert payload["candidates"][0]["symbol"] == "PGEO"
+
+
+def test_get_ai_report_json(monkeypatch, tmp_path) -> None:
+    run_root = tmp_path / "runs"
+    run_dir = run_root / "20260708_205047"
+    run_dir.mkdir(parents=True)
+    (run_dir / "stage6_ai_report.md").write_text("# Report\nThesis", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "DEFAULT_RUN_ROOT", run_root)
+    monkeypatch.setattr(mcp_server, "resolve_artifact_path", lambda d, key: run_dir / "stage6_ai_report.md")
+
+    payload = json.loads(mcp_server.get_ai_report("20260708_205047", output_format="json"))
+
+    assert payload["run_id"] == "20260708_205047"
+    assert "Thesis" in payload["report"]
+
+
+def test_scan_bandar_activity_json(monkeypatch) -> None:
+    mock_df = pd.DataFrame([{"ticker": "ADRO.JK", "net_buy_value": 1e9}])
+    monkeypatch.setattr("interday_liquidity_screener.bandar_tracker.run_bandar_scan", lambda **kw: mock_df)
+
+    payload = json.loads(mcp_server.scan_bandar_activity(output_format="json"))
+
+    assert payload["count"] == 1
+    assert payload["tickers"][0]["ticker"] == "ADRO.JK"
+
+
+def test_get_commodity_prices_json(monkeypatch) -> None:
+    mock_comm = {"COAL": {"symbol": "COAL", "name": "Coal", "last": 130.0, "percent": -1.2}}
+    monkeypatch.setattr("interday_liquidity_screener.commodity_gate.fetch_live_commodities", lambda **kw: mock_comm)
+
+    payload = json.loads(mcp_server.get_commodity_prices(output_format="json"))
+
+    assert payload["count"] == 1
+    assert payload["commodities"][0]["name"] == "Coal"
+
+
+def test_get_run_bundle_json(monkeypatch, tmp_path) -> None:
+    run_root = tmp_path / "runs"
+    run_dir = run_root / "20260708_205047"
+    run_dir.mkdir(parents=True)
+    _write_hybrid_watchlist(run_dir)
+    monkeypatch.setattr(mcp_server, "DEFAULT_RUN_ROOT", run_root)
+
+    payload = json.loads(mcp_server.get_run_bundle("20260708_205047", capital=1_000_000, output_format="json"))
+
+    assert payload["run_id"] == "20260708_205047"
+    assert payload["audit"]["schema_version"] == "run-audit-v1"
+    assert payload["recommendation"]["primary"]["symbol"] == "PGEO"
+
+
+def test_get_run_bundle_rejects_invalid_inputs() -> None:
+    result = mcp_server.get_run_bundle("x", capital=-1, output_format="yaml")
+    assert result.startswith("Error: Invalid MCP input.")
+
+
+def test_start_pipeline_run_rejects_invalid_inputs() -> None:
+    result = mcp_server.start_pipeline_run(strategy_mode="scalping", capital=0)
+    assert result.startswith("Error: Invalid MCP input.")
+    assert "strategy_mode must be 'interday' or 'bpjs'." in result
+
+
+def test_start_pipeline_run_runs_in_background(monkeypatch) -> None:
+    monkeypatch.setattr(
+        mcp_server,
+        "run_trading_pipeline",
+        lambda **kw: "Successfully executed pipeline! Run ID: **20260101_010101**",
+    )
+
+    payload = json.loads(mcp_server.start_pipeline_run(universe_key="lq45", output_format="json"))
+    job_id = payload["job_id"]
+    assert payload["status"] in {"PENDING", "RUNNING", "SUCCEEDED"}
+
+    deadline = time.time() + 5
+    status = payload
+    while time.time() < deadline:
+        status = json.loads(mcp_server.get_pipeline_run_status(job_id, output_format="json"))
+        if status["status"] in {"SUCCEEDED", "FAILED"}:
+            break
+        time.sleep(0.05)
+
+    assert status["status"] == "SUCCEEDED"
+    assert status["run_id"] == "20260101_010101"
+
+
+def test_get_pipeline_run_status_not_found() -> None:
+    payload = json.loads(mcp_server.get_pipeline_run_status("does-not-exist", output_format="json"))
+    assert payload["status"] == "NOT_FOUND"

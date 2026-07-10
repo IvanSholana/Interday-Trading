@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trading Strategy Change"
+  short_description: "Safely change and validate trading behavior"
+  default_prompt: "Use $trading-strategy-change to implement and validate this trading strategy change."
