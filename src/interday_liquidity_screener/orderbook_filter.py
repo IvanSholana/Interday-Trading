@@ -313,7 +313,11 @@ def calculate_orderbook_score(row: dict[str, Any], config: OrderbookFilterConfig
         score += 5
     if row.get("value") is not None and pd.notna(row.get("value")) and row["value"] >= config.min_intraday_value:
         score += 5
-    if not _bool_value(row.get("tradable")):
+    tradable_val = row.get("tradable")
+    is_tradable = True
+    if tradable_val is not None and not pd.isna(tradable_val):
+        is_tradable = _bool_value(tradable_val)
+    if not is_tradable:
         score -= 20
     if _bool_value(row.get("uma")):
         score -= 20
@@ -334,7 +338,11 @@ def calculate_orderbook_score(row: dict[str, Any], config: OrderbookFilterConfig
 def classify_orderbook(row: dict[str, Any], config: OrderbookFilterConfig) -> str:
     if not row.get("orderbook_available"):
         return "NO_ORDERBOOK_DATA"
-    if not _bool_value(row.get("tradable")):
+    tradable_val = row.get("tradable")
+    is_tradable = True
+    if tradable_val is not None and not pd.isna(tradable_val):
+        is_tradable = _bool_value(tradable_val)
+    if not is_tradable:
         return "REJECT_NOT_TRADABLE"
     if _bool_value(row.get("uma")) or row.get("notation_risky", is_notation_risky(row.get("notation"))):
         return "REJECT_UMA_OR_NOTATION_RISK"

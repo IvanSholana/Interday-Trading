@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import date, datetime
 import io
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -36,6 +37,8 @@ try:
         PipelineOptions,
         run_pipeline,
     )
+    from .recommendation import build_recommendation_pack
+    from .run_audit import build_run_audit_report
     from .ticker_universe import UNIVERSE_PRESETS, read_universe_text
     from .tickers import load_tickers, normalize_ticker
 except ImportError:
@@ -56,6 +59,8 @@ except ImportError:
         PipelineOptions,
         run_pipeline,
     )
+    from interday_liquidity_screener.recommendation import build_recommendation_pack
+    from interday_liquidity_screener.run_audit import build_run_audit_report
     from interday_liquidity_screener.ticker_universe import UNIVERSE_PRESETS
     from interday_liquidity_screener.tickers import load_tickers, normalize_ticker
 
@@ -105,7 +110,14 @@ def append_state_log(msg: str):
         pipeline_state.logs.append(f"[{timestamp}] {msg}")
 
 # Background worker for pipeline
-def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: Any, resume: bool = False):
+def run_pipeline_thread(
+    options: PipelineOptions,
+    stages: List[str],
+    run_paths: Any,
+    resume: bool = False,
+    auto_start_monitor: bool = True,
+    monitor_interval_seconds: float = 300.0,
+):
     global pipeline_state
     
     with pipeline_state.lock:
@@ -375,6 +387,21 @@ def run_pipeline_thread(options: PipelineOptions, stages: List[str], run_paths: 
                 pipeline_state.progress = 100.0
                 pipeline_state.current_stage = "Completed"
             append_state_log("Pipeline Execution Completed Successfully.")
+            if auto_start_monitor:
+                monitor_path = paths.hybrid_watchlist if paths.hybrid_watchlist.exists() else paths.stage4
+                if monitor_path.exists():
+                    started = _start_live_monitor(
+                        str(monitor_path),
+                        max(30.0, float(monitor_interval_seconds)),
+                        bypass_market_hours=False,
+                        replace_running=True,
+                    )
+                    if started:
+                        append_state_log(f"Telegram live monitor auto-started: {monitor_path}")
+                    else:
+                        append_state_log("Telegram live monitor auto-start skipped: Telegram/Stockbit credentials are incomplete.")
+                else:
+                    append_state_log("Telegram live monitor auto-start skipped: no watchlist artifact found.")
             
     except Exception as e:
         sys.stdout = original_stdout
@@ -408,6 +435,8 @@ class RunRequest(BaseModel):
     enable_adaptive_tp: Optional[bool] = None
     enable_liquidity_sizer: Optional[bool] = None
     enable_blackout: Optional[bool] = None
+    auto_start_monitor: bool = True
+    monitor_interval_seconds: float = 300.0
     resume_run_id: Optional[str] = None
 
 class SettingsUpdate(BaseModel):
@@ -424,12 +453,13 @@ def get_presets():
     - ``description``: short description.
     - ``ticker_count``: number of tickers in the preset file (0 if file missing).
     """
+    from .ticker_universe import load_universe_tickers
     presets_data = []
     for p in UNIVERSE_PRESETS:
         ticker_count = 0
-        if p.path and p.path.exists():
+        if p.key != "manual":
             try:
-                tickers = load_tickers(p.path)
+                tickers = load_universe_tickers(p.key)
                 ticker_count = len(tickers)
             except Exception:
                 pass
@@ -462,11 +492,9 @@ def get_preset_tickers(key: str):
     preset = [p for p in UNIVERSE_PRESETS if p.key == key]
     if not preset:
         raise HTTPException(status_code=404, detail="Preset not found")
-    p = preset[0]
-    if p.path and p.path.exists():
-        tickers = load_tickers(p.path)
-        return {"tickers": tickers}
-    return {"tickers": []}
+    from .ticker_universe import load_universe_tickers
+    tickers = load_universe_tickers(key)
+    return {"tickers": tickers}
 
 @app.get("/api/settings")
 def get_settings():
@@ -741,6 +769,332 @@ def get_run_report(run_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading report: {e}")
 
+@app.get("/api/recommendation/{run_id}")
+def get_run_recommendation(
+    run_id: str,
+    capital: float = Query(1_000_000.0, gt=0),
+    max_tp_pct: float = Query(0.05, gt=0, le=1),
+    max_position_pct: float = Query(1.0, gt=0, le=1),
+    limit: int = Query(5, ge=1, le=20),
+):
+    """Return capital-aware trade recommendation data for a completed run.
+
+    This endpoint reads the hybrid watchlist and derives a professional
+    decision-support pack: primary candidate, shortlist, lot sizing, TP/SL
+    percentages, estimated gross profit/loss, status readiness, and next
+    action. It does not create new signals or mutate run artifacts.
+
+    Args:
+        run_id: Run directory name (e.g. ``"20260708_091500"``).
+        capital: Available capital in IDR for sizing context.
+        max_tp_pct: Maximum TP percentage allowed by the user's plan.
+        max_position_pct: Maximum capital allocation for a single candidate.
+        limit: Maximum shortlist rows returned.
+
+    Raises:
+        404: If the run directory or hybrid watchlist file does not exist.
+        500: If the watchlist CSV cannot be parsed.
+    """
+    run_dir = DEFAULT_RUN_ROOT / run_id
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    path = resolve_artifact_path(run_dir, "hybrid_watchlist")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Hybrid watchlist not generated for this run")
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading watchlist: {e}")
+
+    pack = build_recommendation_pack(
+        df,
+        run_id=run_id,
+        capital=capital,
+        max_tp_pct=max_tp_pct,
+        max_position_pct=max_position_pct,
+        limit=limit,
+    )
+    return pack.to_dict()
+
+@app.get("/api/run-audit/{run_id}")
+def get_run_audit(
+    run_id: str,
+    capital: float = Query(1_000_000.0, gt=0),
+    max_tp_pct: float = Query(0.05, gt=0, le=1),
+    max_position_pct: float = Query(1.0, gt=0, le=1),
+):
+    """Return artifact health and decision-readiness audit for a run.
+
+    The audit combines stage artifact existence/row checks, run summary, and
+    the capital-aware recommendation pack. It is read-only and never mutates
+    pipeline artifacts.
+    """
+    run_dir = DEFAULT_RUN_ROOT / run_id
+    report = build_run_audit_report(
+        run_dir,
+        resolve_artifact_path=resolve_artifact_path,
+        summarize_run=summarize_run,
+        capital=capital,
+        max_tp_pct=max_tp_pct,
+        max_position_pct=max_position_pct,
+    )
+    if report.overall_status == "MISSING_RUN":
+        raise HTTPException(status_code=404, detail="Run not found")
+    return report.to_dict()
+
+class BandarScanRequest(BaseModel):
+    config_path: str = "config/bandar_tracker.json"
+    output_path: str = "data/output/bandar_scan_results.csv"
+    force_refresh: bool = False
+    investor_type: Optional[str] = None
+    period: Optional[str] = None
+
+class LiveMonitorStartRequest(BaseModel):
+    watchlist_path: str = ""
+    interval_seconds: float = 300.0
+    bypass_market_hours: bool = False
+
+def make_json_safe(value: Any) -> Any:
+    """Return a JSON-compatible value, replacing NaN/Infinity with null."""
+    if value is None:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        if not isinstance(value, (dict, list, tuple, set)) and pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    return value
+
+def to_json_safe_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Convert a DataFrame to JSON-safe records for FastAPI responses."""
+    return make_json_safe(df.to_dict(orient="records"))
+
+class LiveMonitorRuntime:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+        self.running = False
+        self.watchlist_path = ""
+        self.interval_seconds = 300.0
+        self.bypass_market_hours = False
+        self.started_at: str | None = None
+        self.last_scan_at: str | None = None
+        self.last_error: str | None = None
+        self.last_result_count = 0
+        self.logs: list[str] = []
+
+    def append_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        with self.lock:
+            self.logs.append(f"[{timestamp}] {message}")
+            self.logs = self.logs[-100:]
+
+live_monitor_state = LiveMonitorRuntime()
+
+def _latest_monitor_watchlist_path() -> str:
+    candidates = list(Path("data/output/ui_runs").glob("*/hybrid_watchlist.csv"))
+    candidates += list(Path("data/output").glob("*watchlist*.csv"))
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        return "data/output/stage4_today.csv"
+    return str(max(existing, key=lambda path: path.stat().st_mtime))
+
+def _read_live_monitor_results() -> list[dict[str, Any]]:
+    path = Path("data/output/live_monitor_status.json")
+    if not path.exists():
+        return []
+    try:
+        return make_json_safe(json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        return []
+
+def _telegram_and_stockbit_configured() -> bool:
+    return bool(
+        (os.getenv("TELEGRAM_TOKEN") or token_available("TELEGRAM_TOKEN"))
+        and (os.getenv("TELEGRAM_CHAT_ID") or token_available("TELEGRAM_CHAT_ID"))
+        and (os.getenv("STOCKBIT_TOKEN") or token_available("STOCKBIT_TOKEN"))
+    )
+
+def _live_monitor_status_payload() -> dict[str, Any]:
+    with live_monitor_state.lock:
+        payload = {
+            "running": live_monitor_state.running,
+            "watchlist_path": live_monitor_state.watchlist_path or _latest_monitor_watchlist_path(),
+            "interval_seconds": live_monitor_state.interval_seconds,
+            "bypass_market_hours": live_monitor_state.bypass_market_hours,
+            "started_at": live_monitor_state.started_at,
+            "last_scan_at": live_monitor_state.last_scan_at,
+            "last_error": live_monitor_state.last_error,
+            "last_result_count": live_monitor_state.last_result_count,
+            "logs": list(live_monitor_state.logs),
+            "telegram_configured": bool(
+                (os.getenv("TELEGRAM_TOKEN") or token_available("TELEGRAM_TOKEN"))
+                and (os.getenv("TELEGRAM_CHAT_ID") or token_available("TELEGRAM_CHAT_ID"))
+            ),
+            "stockbit_configured": bool(os.getenv("STOCKBIT_TOKEN") or token_available("STOCKBIT_TOKEN")),
+            "latest_watchlist_path": _latest_monitor_watchlist_path(),
+            "last_results": _read_live_monitor_results()[:50],
+        }
+    return payload
+
+def _start_live_monitor(
+    watchlist_path: str,
+    interval_seconds: float,
+    bypass_market_hours: bool = False,
+    replace_running: bool = False,
+) -> bool:
+    if not _telegram_and_stockbit_configured():
+        return False
+
+    watchlist = Path(watchlist_path)
+    if not watchlist.exists():
+        raise FileNotFoundError(f"Watchlist file not found: {watchlist_path}")
+
+    with live_monitor_state.lock:
+        if live_monitor_state.running and not replace_running:
+            return True
+        if live_monitor_state.running:
+            live_monitor_state.stop_event.set()
+
+        stop_event = threading.Event()
+        live_monitor_state.stop_event = stop_event
+        live_monitor_state.running = True
+        live_monitor_state.watchlist_path = str(watchlist)
+        live_monitor_state.interval_seconds = float(interval_seconds)
+        live_monitor_state.bypass_market_hours = bool(bypass_market_hours)
+        live_monitor_state.started_at = datetime.now().isoformat()
+        live_monitor_state.last_error = None
+        live_monitor_state.logs = []
+        thread = threading.Thread(
+            target=_run_live_monitor_loop,
+            args=(str(watchlist), float(interval_seconds), bool(bypass_market_hours), stop_event),
+            daemon=True,
+        )
+        live_monitor_state.thread = thread
+        thread.start()
+    return True
+
+def _run_live_monitor_loop(
+    watchlist_path: str,
+    interval_seconds: float,
+    bypass_market_hours: bool,
+    stop_event: threading.Event,
+) -> None:
+    from .monitor import LiveTickerMonitor
+
+    monitor = LiveTickerMonitor(watchlist_path=watchlist_path)
+    live_monitor_state.append_log(f"Live monitor started for {watchlist_path} every {interval_seconds:.0f}s.")
+    try:
+        while not stop_event.is_set():
+            try:
+                results = monitor.monitor_once(bypass_market_hours=bypass_market_hours)
+                with live_monitor_state.lock:
+                    live_monitor_state.last_scan_at = datetime.now().isoformat()
+                    live_monitor_state.last_error = None
+                    live_monitor_state.last_result_count = len(results)
+                live_monitor_state.append_log(f"Scan completed: {len(results)} monitored rows.")
+            except Exception as exc:
+                with live_monitor_state.lock:
+                    live_monitor_state.last_scan_at = datetime.now().isoformat()
+                    live_monitor_state.last_error = str(exc)
+                live_monitor_state.append_log(f"Scan failed: {exc}")
+            if stop_event.wait(interval_seconds):
+                break
+    finally:
+        with live_monitor_state.lock:
+            if live_monitor_state.stop_event is stop_event:
+                live_monitor_state.running = False
+        live_monitor_state.append_log("Live monitor stopped.")
+
+@app.get("/api/bandar-scan")
+def get_bandar_scan_results(output_path: str = "data/output/bandar_scan_results.csv"):
+    """Return candidates from the last Bandar Scanner run."""
+    path = Path(output_path)
+    if not path.exists():
+        from .bandar_tracker import run_bandar_scan
+        try:
+            df = run_bandar_scan("config/bandar_tracker.json", output_path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error executing initial scan: {e}")
+    else:
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error reading scan results CSV: {e}")
+            
+    return to_json_safe_records(df)
+
+@app.post("/api/bandar-scan/run")
+def trigger_bandar_scan(payload: BandarScanRequest):
+    """Run a fresh Bandar Scanner (Smart Money) scan and return results."""
+    from .bandar_tracker import run_bandar_scan
+    try:
+        df = run_bandar_scan(
+            config_path=payload.config_path,
+            output_path=payload.output_path,
+            force_refresh=payload.force_refresh,
+            override_investor_type=payload.investor_type,
+            override_period=payload.period
+        )
+        return to_json_safe_records(df)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error running bandar scan: {e}")
+
+@app.get("/api/commodities")
+def get_live_commodities(force_refresh: bool = False):
+    """Return live global commodities prices and daily changes."""
+    from .commodity_gate import fetch_live_commodities
+    try:
+        commodities = fetch_live_commodities(force_refresh=force_refresh)
+        return list(commodities.values())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching commodities: {e}")
+
+@app.get("/api/live-monitor/status")
+def get_live_monitor_status_api():
+    """Return Telegram live monitor runtime state and recent scan output."""
+    return _live_monitor_status_payload()
+
+@app.post("/api/live-monitor/start")
+def start_live_monitor_api(payload: LiveMonitorStartRequest):
+    """Start the Telegram live monitor loop in the background."""
+    watchlist_path = payload.watchlist_path.strip() or _latest_monitor_watchlist_path()
+    watchlist = Path(watchlist_path)
+    if not watchlist.exists():
+        raise HTTPException(status_code=404, detail=f"Watchlist file not found: {watchlist_path}")
+    if payload.interval_seconds < 30:
+        raise HTTPException(status_code=400, detail="Interval minimal 30 detik agar tidak terlalu agresif ke Stockbit/Telegram.")
+
+    started = _start_live_monitor(
+        str(watchlist),
+        float(payload.interval_seconds),
+        bool(payload.bypass_market_hours),
+        replace_running=True,
+    )
+    if not started:
+        raise HTTPException(status_code=400, detail="TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, atau STOCKBIT_TOKEN belum lengkap.")
+    return _live_monitor_status_payload()
+
+@app.post("/api/live-monitor/stop")
+def stop_live_monitor_api():
+    """Request the Telegram live monitor loop to stop."""
+    live_monitor_state.stop_event.set()
+    with live_monitor_state.lock:
+        live_monitor_state.running = False
+    live_monitor_state.append_log("Stop requested from dashboard.")
+    return _live_monitor_status_payload()
+
 @app.get("/api/status")
 def get_pipeline_status():
     """Return the real-time status of the currently active (or last) pipeline run.
@@ -820,9 +1174,8 @@ def trigger_run(payload: RunRequest, background_tasks: BackgroundTasks):
     
     tickers_list = []
     if payload.universe_key != "manual":
-        preset = [p for p in UNIVERSE_PRESETS if p.key == payload.universe_key]
-        if preset and preset[0].path and preset[0].path.exists():
-            tickers_list = load_tickers(preset[0].path)
+        from .ticker_universe import load_universe_tickers
+        tickers_list = load_universe_tickers(payload.universe_key)
     else:
         tickers_list = parse_ticker_text(payload.tickers)
         
@@ -873,7 +1226,14 @@ def trigger_run(payload: RunRequest, background_tasks: BackgroundTasks):
         
     thread = threading.Thread(
         target=run_pipeline_thread,
-        args=(options, payload.stages, run_paths, bool(payload.resume_run_id)),
+        args=(
+            options,
+            payload.stages,
+            run_paths,
+            bool(payload.resume_run_id),
+            payload.auto_start_monitor,
+            payload.monitor_interval_seconds,
+        ),
         daemon=True
     )
     thread.start()
@@ -890,6 +1250,67 @@ def parse_ticker_text(text: str) -> list[str]:
         if ticker:
             tickers.add(ticker)
     return sorted(tickers)
+
+class ScheduledTaskModel(BaseModel):
+    name: str
+    time: str
+    strategy_mode: str
+    tickers_file: str
+    universe_key: Optional[str] = None
+    capital: float
+    max_position_pct: float
+    stages: list[str]
+
+class ScheduleConfigModel(BaseModel):
+    tasks: list[ScheduledTaskModel]
+
+SCHEDULE_PATH = Path("config/schedule.json")
+
+@app.get("/api/schedule", response_model=ScheduleConfigModel)
+def get_schedule():
+    """Read the scheduler config task list."""
+    if not SCHEDULE_PATH.exists():
+        return {"tasks": []}
+    try:
+        with open(SCHEDULE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read schedule: {e}")
+
+@app.post("/api/schedule")
+def update_schedule(config: ScheduleConfigModel):
+    """Overwrite the scheduler config task list."""
+    SCHEDULE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(SCHEDULE_PATH, "w", encoding="utf-8") as f:
+            json.dump(config.dict(), f, indent=2)
+        return {"status": "success", "message": "Schedule updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write schedule: {e}")
+
+@app.post("/api/schedule/run-task")
+def run_scheduled_task(task: ScheduledTaskModel, background_tasks: BackgroundTasks):
+    """Trigger a scheduled task run immediately in the background."""
+    from .scheduler import PipelineScheduler, ScheduledTask
+    
+    temp_task = ScheduledTask(
+        name=task.name,
+        time_str=task.time,
+        strategy_mode=task.strategy_mode,
+        tickers_file=task.tickers_file,
+        capital=task.capital,
+        max_position_pct=task.max_position_pct,
+        stages=task.stages
+    )
+    
+    def _run_bg():
+        sched = PipelineScheduler(config_path=SCHEDULE_PATH)
+        today = datetime.now().date().isoformat()
+        sched.run_task(temp_task, today)
+        
+    background_tasks.add_task(_run_bg)
+    return {"status": "started", "message": f"Task '{task.name}' triggered in background"}
+
 
 # Serve compiled React static files (in production)
 static_dir = Path(__file__).resolve().parent / "static"

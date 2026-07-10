@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "pandas>=2.0",
     "yfinance>=0.2.40",
+    "mcp>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,7 @@ dev = [
 [project.scripts]
 liquidity-screen = "interday_liquidity_screener.cli:main"
 interday-web = "interday_liquidity_screener.server:launch"
+interday-mcp = "interday_liquidity_screener.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

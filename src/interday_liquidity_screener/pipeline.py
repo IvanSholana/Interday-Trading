@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from contextlib import redirect_stdout
 from dataclasses import dataclass
@@ -34,6 +34,7 @@ try:
     from .ticker_universe import UNIVERSE_PRESETS, get_universe_preset, read_universe_text
     from .tickers import load_tickers, normalize_ticker
     from .trade_plan import TradePlanConfig, run_stage_4_trade_plan
+    from .constants import WatchlistStatus
 except ImportError:
     package_root = Path(__file__).resolve().parents[1]
     if str(package_root) not in sys.path:
@@ -58,6 +59,7 @@ except ImportError:
     from interday_liquidity_screener.ticker_universe import UNIVERSE_PRESETS, get_universe_preset, read_universe_text
     from interday_liquidity_screener.tickers import load_tickers, normalize_ticker
     from interday_liquidity_screener.trade_plan import TradePlanConfig, run_stage_4_trade_plan
+    from interday_liquidity_screener.constants import WatchlistStatus
 
 APP_TITLE = "Interday Trading Dashboard"
 DEFAULT_RUN_ROOT = Path("data/output/ui_runs")
@@ -393,7 +395,7 @@ def summarize_run(run_dir: str | Path) -> dict[str, Any]:
         "stage2_rows": int(len(stage2)),
         "bandar_watch": _sum_bool(stage2, "bandar_watch_eligible"),
         "valid_trade_plans": _count_in(stage4, "trade_status", {"VALID_TRADE_PLAN"}),
-        "hybrid_ready": _count_in(hybrid, "final_status", {"EXECUTION_READY"}),
+        "hybrid_ready": _count_in(hybrid, "final_status", {WatchlistStatus.EXECUTION_READY}),
         "hybrid_watch_rows": int(len(hybrid)),
         "closed_trades": metrics.get("entry_triggered_count", 0),
         "win_rate": metrics.get("win_rate"),
@@ -571,6 +573,11 @@ def run_pipeline(
                     orderbook_path=orderbook_path,
                     date=options.run_date,
                     max_candidates=options.hybrid_max_candidates,
+                    enable_market_regime=options.enable_market_regime,
+                    enable_multibar_confirm=options.enable_multibar_confirm,
+                    enable_adaptive_tp=options.enable_adaptive_tp,
+                    enable_liquidity_sizer=options.enable_liquidity_sizer,
+                    enable_blackout=options.enable_blackout,
                 ),
                 resume=resume,
             )
@@ -606,7 +613,7 @@ def run_pipeline(
                 paths.stage5_bpjs_paper,
                 lambda: run_stage5_paper_bpjs(
                     paths.stage4,
-                    paths.stage3c if paths.stage3c.exists() else None,
+                    paths.stage3c if paths.stage3c.exists() and paths.stage3c.stat().st_size > 10 else None,
                     paths.stage5_bpjs_paper,
                     bpjs_config,
                     summary_output_path=paths.stage5_bpjs_summary,
@@ -625,7 +632,7 @@ def run_pipeline(
                 lambda: run_stage6_build_evidence(
                     paths.stage2,
                     paths.stage3b if paths.stage3b.exists() else None,
-                    paths.stage3c if paths.stage3c.exists() else None,
+                    paths.stage3c if paths.stage3c.exists() and paths.stage3c.stat().st_size > 10 else None,
                     paths.stage4,
                     paths.stage5_metrics if paths.stage5_metrics.exists() else None,
                     paths.stage5_bpjs_summary if paths.stage5_bpjs_summary.exists() else None,

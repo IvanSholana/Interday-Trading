@@ -9,6 +9,7 @@ from .backtest.config import CostModelConfig
 from .backtest.cost_model import CostModel
 from .backtest.simulator import TradeSimulation, TradeSimulator
 from .hybrid_screener import HybridScreenerConfig, build_hybrid_watchlist, load_hybrid_config
+from .constants import WatchlistStatus
 
 
 BACKTEST_MODES = ("normal_execution", "smart_money_first", "hybrid_dual_flow")
@@ -19,7 +20,12 @@ class HybridBacktestConfig:
     modes: tuple[str, ...] = BACKTEST_MODES
     time_stop_days: int = 10
     same_day_ambiguity: str = "worst_case"
-    executable_statuses: tuple[str, ...] = ("EXECUTION_READY", "EXECUTION_CANDIDATE", "EXECUTION_DRAFT", "READY_SOON")
+    executable_statuses: tuple[WatchlistStatus, ...] = (
+        WatchlistStatus.EXECUTION_READY,
+        WatchlistStatus.EXECUTION_CANDIDATE,
+        WatchlistStatus.EXECUTION_DRAFT,
+        WatchlistStatus.READY_SOON,
+    )
 
 
 def _ticker_key(row: pd.Series) -> str:

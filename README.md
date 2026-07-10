@@ -28,6 +28,14 @@ Panduan penggunaan dashboard yang lebih santai dan langkah demi langkah tersedia
 
 Dashboard mendukung mode daftar saham dari file lokal di `data/input/universes`, termasuk semua IDX, saham syariah, LQ45, IDX30, IDX80, JII, Kompas100, SRI-KEHATI, Bisnis-27, dan PEFINDO25. Update file preset tersebut saat konstituen indeks berubah.
 
+MCP server untuk agent workflow tersedia lewat:
+
+```powershell
+interday-mcp
+```
+
+Gunakan [docs/mcp_professional_workflow.md](docs/mcp_professional_workflow.md) untuk alur profesional: scan malam, recommendation pack, audit flags, output JSON/Markdown, dan konfirmasi orderbook pagi.
+
 Stage 1 - screening likuiditas:
 
 ```powershell

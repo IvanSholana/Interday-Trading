@@ -162,3 +162,8 @@ def test_normalize_real_stockbit_broker_summary_long() -> None:
     assert rows[1]["side"] == "SELL"
     assert rows[1]["net_value"] == 2_800_000_000
     assert rows[1]["frequency"] == 21_000
+
+
+def test_stage2_trading_dates_returns_empty() -> None:
+    assert collector._stage2_trading_dates("dummy_path.csv") == []
+

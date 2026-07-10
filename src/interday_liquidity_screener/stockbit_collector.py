@@ -126,17 +126,10 @@ def _parse_date(value: str | date) -> date:
 
 
 def _stage2_trading_dates(input_path: str | Path) -> list[str]:
-    path = Path(input_path)
-    if not path.exists():
-        return []
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return []
-    if "last_date" not in df.columns:
-        return []
-    dates = sorted({str(value)[:10] for value in df["last_date"].dropna() if str(value)[:10]})
-    return [value for value in dates if len(value) == 10]
+    # The Stage 2 file only contains a single snapshot date (run date), so
+    # returning dates from it forces all windows to use that single date.
+    # We return an empty list to trigger the robust calendar-day fallback instead.
+    return []
 
 
 def resolve_window_dates(

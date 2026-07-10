@@ -46,6 +46,10 @@ interface SidebarProps {
   setEnableLiquiditySizer: (b: boolean) => void;
   enableBlackout: boolean;
   setEnableBlackout: (b: boolean) => void;
+  autoStartMonitor: boolean;
+  setAutoStartMonitor: (b: boolean) => void;
+  monitorIntervalMinutes: number;
+  setMonitorIntervalMinutes: (m: number) => void;
   isRunning: boolean;
   onStartRun: (resumeRunId?: string) => void;
   onCancelRun: () => void;
@@ -83,6 +87,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   setEnableLiquiditySizer,
   enableBlackout,
   setEnableBlackout,
+  autoStartMonitor,
+  setAutoStartMonitor,
+  monitorIntervalMinutes,
+  setMonitorIntervalMinutes,
   isRunning,
   onStartRun,
   onCancelRun,
@@ -429,6 +437,32 @@ export const Sidebar: React.FC<SidebarProps> = ({
               />
               Simulasi AI Laporan (Stage 6)
             </label>
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '0.85rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                style={{ accentColor: 'var(--primary)', marginTop: '3px' }}
+                checked={autoStartMonitor}
+                onChange={() => setAutoStartMonitor(!autoStartMonitor)}
+              />
+              <div>
+                <div style={{ color: 'white', fontWeight: 500 }}>Auto-start Telegram Monitor setelah run</div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '2px' }}>
+                  Setelah pipeline selesai, monitor otomatis pakai watchlist terbaru dan kirim alert saat trigger.
+                </div>
+              </div>
+            </label>
+            {autoStartMonitor && (
+              <div className="form-group" style={{ marginTop: '4px' }}>
+                <label className="form-label">Interval Monitor (menit)</label>
+                <input
+                  type="number"
+                  min={1}
+                  className="form-input"
+                  value={monitorIntervalMinutes}
+                  onChange={(event) => setMonitorIntervalMinutes(Number(event.target.value) || 1)}
+                />
+              </div>
+            )}
           </div>
         </div>
 

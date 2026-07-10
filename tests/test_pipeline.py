@@ -9,7 +9,9 @@ from interday_liquidity_screener.pipeline import (
     create_run_id,
     load_csv,
     parse_ticker_text,
+    PipelineOptions,
     resolve_artifact_path,
+    run_pipeline,
     token_available,
 )
 
@@ -74,3 +76,38 @@ def test_load_csv_returns_empty_dataframe_for_empty_file(tmp_path) -> None:
     empty_csv.write_text("", encoding="utf-8")
 
     assert load_csv(empty_csv).empty
+
+
+def test_run_pipeline_forwards_hybrid_enhancement_flags(tmp_path, monkeypatch) -> None:
+    import interday_liquidity_screener.pipeline as pipeline
+
+    captured = {}
+    ticker_file = tmp_path / "tickers.txt"
+    ticker_file.write_text("BBCA.JK\n", encoding="utf-8")
+    paths = build_run_paths(tmp_path / "runs", "20260708_210000")
+
+    def fake_run_hybrid_screener(**kwargs):
+        captured.update(kwargs)
+        kwargs["output_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["output_path"].write_text("symbol,final_status\nBBCA,EXECUTION_DRAFT\n", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "run_hybrid_screener", fake_run_hybrid_screener)
+
+    options = PipelineOptions(
+        tickers_file=ticker_file,
+        run_root=tmp_path / "runs",
+        enable_market_regime=True,
+        enable_multibar_confirm=True,
+        enable_adaptive_tp=True,
+        enable_liquidity_sizer=True,
+        enable_blackout=True,
+    )
+
+    _, results = run_pipeline(options, ["hybrid"], paths=paths)
+
+    assert results[-1].ok is True
+    assert captured["enable_market_regime"] is True
+    assert captured["enable_multibar_confirm"] is True
+    assert captured["enable_adaptive_tp"] is True
+    assert captured["enable_liquidity_sizer"] is True
+    assert captured["enable_blackout"] is True

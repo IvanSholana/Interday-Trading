@@ -1,0 +1,23 @@
+{
+  "tasks": [
+    {
+      "name": "pagi_hari",
+      "time": "09:00",
+      "strategy_mode": "bpjs",
+      "tickers_file": "data/input/universes/lq45.txt",
+      "universe_key": "bandar",
+      "capital": 500000.0,
+      "max_position_pct": 0.5,
+      "stages": [
+        "stage1",
+        "stage2",
+        "stage3a",
+        "stage3b",
+        "stage4",
+        "hybrid",
+        "stage3c",
+        "stage5"
+      ]
+    }
+  ]
+}

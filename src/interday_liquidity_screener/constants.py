@@ -127,6 +127,11 @@ class WatchlistStatus(str, Enum):
     Risk-to-reward ratio is below the configured minimum (typically < 1.5).
     """
 
+    COMMODITY_HEADWIND = "COMMODITY_HEADWIND"
+    """
+    The underlying global commodity is down heavily. Avoid buying this ticker now.
+    """
+
     DATA_INSUFFICIENT = "DATA_INSUFFICIENT"
     """
     Not enough OHLCV or broker-flow data to compute a reliable score.

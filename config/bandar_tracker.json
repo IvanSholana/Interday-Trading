@@ -1,0 +1,6 @@
+{
+  "whitelist_brokers": ["AK", "ZP", "BK", "XL", "RX", "KZ", "YJ"],
+  "track_investor_type": "INVESTOR_TYPE_FOREIGN",
+  "track_period": "RT_PERIOD_LAST_7_DAYS",
+  "min_accumulation_value": 1000000000
+}

@@ -439,6 +439,7 @@ def test_strategy_mode_defaults_remain_interday() -> None:
     assert config.strategy_mode == "interday"
     assert config.tp1_pct == 0.05
     assert config.tp2_pct == 0.08
+    assert config.max_stop_loss_pct == 0.08
     assert config.time_stop_days == 10
     assert config.require_orderbook_confirmation is False
     assert config.force_exit_same_day is False
@@ -597,3 +598,19 @@ def test_invalid_plan_after_rounding_has_no_executable_lot() -> None:
 
     assert result["is_plan_valid"] is False
     assert result["executable_position_size_lots"] == 0
+
+
+def test_sideways_compression_context_is_active() -> None:
+    # Verify SIDEWAYS_COMPRESSION is in ACTIVE_TECHNICAL_CONTEXTS and builds a valid plan if accumulation is confirmed
+    result = build_trade_plan_row(
+        bandar_row(
+            technical_context="SIDEWAYS_COMPRESSION",
+            entry_setup="WATCH_ENTRY",
+            entry_price=1000,
+            stop_loss=970,
+        ),
+        TradePlanConfig(capital=100_000_000, max_stop_loss_pct=0.08, min_rr_tp1=1.2, min_rr_tp2=1.8),
+    )
+
+    assert result["trade_status"] == "VALID_TRADE_PLAN"
+    assert result["is_plan_valid"] is True

@@ -19,6 +19,8 @@ import type {
   PipelineStatus,
   PipelineStatusValue,
   RunRequest,
+  RecommendationPack,
+  RunAuditReport,
 } from '../types/api';
 
 // ---------------------------------------------------------------------------
@@ -38,7 +40,12 @@ export interface PipelineActions {
   runsList: RunSummary[];
   selectedRunId: string;
   setSelectedRunId: (id: string) => void;
+  recommendationPack: RecommendationPack | null;
+  runAudit: RunAuditReport | null;
+  recommendationLoading: boolean;
+  recommendationError: string | null;
   fetchRunsList: (selectLatest?: boolean) => Promise<void>;
+  fetchRecommendation: (runId: string, capital: number, maxTpPct?: number, maxPositionPct?: number) => Promise<void>;
   handleStartRun: (payload: RunRequest, resumeRunId?: string) => Promise<void>;
   handleCancelRun: () => Promise<void>;
 }
@@ -51,6 +58,10 @@ export function usePipeline(): PipelineState & PipelineActions {
   // ── Runs explorer ─────────────────────────────────────────────────────────
   const [runsList, setRunsList] = useState<RunSummary[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string>('');
+  const [recommendationPack, setRecommendationPack] = useState<RecommendationPack | null>(null);
+  const [runAudit, setRunAudit] = useState<RunAuditReport | null>(null);
+  const [recommendationLoading, setRecommendationLoading] = useState<boolean>(false);
+  const [recommendationError, setRecommendationError] = useState<string | null>(null);
 
   // ── Active pipeline execution ──────────────────────────────────────────────
   const [isRunning, setIsRunning] = useState<boolean>(false);
@@ -75,6 +86,42 @@ export function usePipeline(): PipelineState & PipelineActions {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const fetchRecommendation = useCallback(
+    async (runId: string, capital: number, maxTpPct = 0.05, maxPositionPct = 1.0): Promise<void> => {
+      if (!runId) {
+        setRecommendationPack(null);
+        setRunAudit(null);
+        return;
+      }
+
+      setRecommendationLoading(true);
+      setRecommendationError(null);
+      try {
+        const params = new URLSearchParams({
+          capital: String(capital),
+          max_tp_pct: String(maxTpPct),
+          max_position_pct: String(maxPositionPct),
+        });
+        const res = await fetch(`/api/run-audit/${runId}?${params.toString()}`);
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error((err as { detail?: string }).detail ?? 'Failed to load run audit');
+        }
+        const data: RunAuditReport = await res.json();
+        setRunAudit(data);
+        setRecommendationPack(data.recommendation);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : 'Error loading run audit';
+        setRecommendationError(message);
+        setRecommendationPack(null);
+        setRunAudit(null);
+      } finally {
+        setRecommendationLoading(false);
+      }
+    },
+    [],
+  );
 
   // ── Apply a status snapshot from the API ──────────────────────────────────
 
@@ -222,8 +269,13 @@ export function usePipeline(): PipelineState & PipelineActions {
     runsList,
     selectedRunId,
     setSelectedRunId,
+    recommendationPack,
+    runAudit,
+    recommendationLoading,
+    recommendationError,
     // Actions
     fetchRunsList,
+    fetchRecommendation,
     handleStartRun,
     handleCancelRun,
   };

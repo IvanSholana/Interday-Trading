@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Search, Download, ArrowUpDown, ChevronLeft, ChevronRight, FileSpreadsheet } from 'lucide-react';
+import type { RunCsvCellValue, RunCsvResponse, RunCsvRow } from '../types/api';
 
 interface ResultsTableProps {
   runId: string;
@@ -7,7 +8,7 @@ interface ResultsTableProps {
 
 export const ResultsTable: React.FC<ResultsTableProps> = ({ runId }) => {
   const [stage, setStage] = useState('stage4');
-  const [data, setData] = useState<any[]>([]);
+  const [data, setData] = useState<RunCsvRow[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(20);
@@ -51,7 +52,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ runId }) => {
       }
       
       const res = await fetch(url);
-      const result = await res.json();
+      const result: RunCsvResponse = await res.json();
       if (result.records) {
         setData(result.records);
         setTotal(result.total);
@@ -105,7 +106,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ runId }) => {
       }
 
       const res = await fetch(url);
-      const result = await res.json();
+      const result: RunCsvResponse = await res.json();
       const records = result.records;
       
       if (!records || records.length === 0) {
@@ -116,7 +117,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ runId }) => {
       const headers = Object.keys(records[0]);
       const csvRows = [
         headers.join(','), // Header row
-        ...records.map((row: any) =>
+        ...records.map((row: RunCsvRow) =>
           headers
             .map((header) => {
               const val = row[header];
@@ -145,7 +146,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ runId }) => {
   };
 
   // Cell Renderer for beautiful UI badges
-  const renderCellContent = (col: string, val: any) => {
+  const renderCellContent = (col: string, val: RunCsvCellValue) => {
     if (val === null || val === undefined || val === '') return '-';
     
     // Status formatters
@@ -188,7 +189,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ runId }) => {
     // Currency formatters
     const priceCols = ['entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2', 'exit_price', 'capital', 'risk_value', 'position_size_value'];
     if (priceCols.includes(col)) {
-      const num = parseFloat(val);
+      const num = parseFloat(String(val));
       if (!isNaN(num)) {
         if (num > 10000) {
           // Format as IDR currency
@@ -200,7 +201,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({ runId }) => {
 
     // Percent values
     if (col.endsWith('_pct') || col === 'win_rate' || col === 'return_pct' || col === 'slippage_pct') {
-      const num = parseFloat(val);
+      const num = parseFloat(String(val));
       if (!isNaN(num)) {
         // If values are ratios e.g. 0.05, format as 5%
         if (Math.abs(num) < 1 && num !== 0) {

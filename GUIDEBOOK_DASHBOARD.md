@@ -39,7 +39,7 @@ interday-web
 Setelah itu buka browser Anda di alamat:
 
 ```text
-http://localhost:8000/
+http://localhost:8787/
 ```
 
 ## 3. Alur Harian Yang Disarankan

@@ -1,15 +1,19 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { ProgressVisualizer } from './components/ProgressVisualizer';
 import { ResultsTable } from './components/ResultsTable';
 import { ChartsDashboard } from './components/ChartsDashboard';
 import { ReportViewer } from './components/ReportViewer';
-import { Terminal, Database, Calendar, BarChart3, FileText, LayoutDashboard, DatabaseZap } from 'lucide-react';
+import { RecommendationPanel } from './components/RecommendationPanel';
+import { SmartMoneyScanner } from './components/SmartMoneyScanner';
+import { SchedulerPanel } from './components/SchedulerPanel';
+import { LiveMonitorPanel } from './components/LiveMonitorPanel';
+import { Database, BarChart3, FileText, LayoutDashboard, Compass, Clock, BellRing } from 'lucide-react';
 import { usePipeline } from './hooks/usePipeline';
 import type { RunRequest, CapitalProfile } from './types/api';
 
 /** Active navigation tab options. */
-type ActiveTab = 'dashboard' | 'results' | 'charts' | 'report';
+type ActiveTab = 'dashboard' | 'smart_money' | 'scheduler' | 'monitor' | 'results' | 'charts' | 'report';
 
 export default function App() {
   // ── Sidebar / pipeline config state ──────────────────────────────────────
@@ -32,6 +36,8 @@ export default function App() {
   const [enableAdaptiveTp, setEnableAdaptiveTp] = useState<boolean>(false);
   const [enableLiquiditySizer, setEnableLiquiditySizer] = useState<boolean>(false);
   const [enableBlackout, setEnableBlackout] = useState<boolean>(false);
+  const [autoStartMonitor, setAutoStartMonitor] = useState<boolean>(true);
+  const [monitorIntervalMinutes, setMonitorIntervalMinutes] = useState<number>(5);
 
   // ── Navigation tab ────────────────────────────────────────────────────────
   const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard');
@@ -47,7 +53,12 @@ export default function App() {
     runsList,
     selectedRunId,
     setSelectedRunId,
+    recommendationPack,
+    runAudit,
+    recommendationLoading,
+    recommendationError,
     fetchRunsList,
+    fetchRecommendation,
     handleStartRun,
     handleCancelRun,
   } = usePipeline();
@@ -83,6 +94,8 @@ export default function App() {
       enable_adaptive_tp: enableAdaptiveTp,
       enable_liquidity_sizer: enableLiquiditySizer,
       enable_blackout: enableBlackout,
+      auto_start_monitor: autoStartMonitor,
+      monitor_interval_seconds: Math.max(1, monitorIntervalMinutes) * 60,
     };
     setActiveTab('dashboard');
     await handleStartRun(payload, resumeRunId);
@@ -90,6 +103,11 @@ export default function App() {
 
   // ── Derived values ────────────────────────────────────────────────────────
   const selectedRunSummary = runsList.find((r) => r.run === selectedRunId);
+
+  useEffect(() => {
+    if (!selectedRunId || isRunning) return;
+    fetchRecommendation(selectedRunId, capital, 0.05, maxPositionPct / 100);
+  }, [selectedRunId, capital, maxPositionPct, isRunning, fetchRecommendation]);
 
   return (
     <div className="app-container">
@@ -125,6 +143,10 @@ export default function App() {
         setEnableLiquiditySizer={setEnableLiquiditySizer}
         enableBlackout={enableBlackout}
         setEnableBlackout={setEnableBlackout}
+        autoStartMonitor={autoStartMonitor}
+        setAutoStartMonitor={setAutoStartMonitor}
+        monitorIntervalMinutes={monitorIntervalMinutes}
+        setMonitorIntervalMinutes={setMonitorIntervalMinutes}
         isRunning={isRunning}
         onStartRun={onStartRun}
         onCancelRun={handleCancelRun}
@@ -196,20 +218,26 @@ export default function App() {
 
         {/* Navigation Tabs */}
         <div style={{ display: 'flex', gap: '8px', borderBottom: '1px solid var(--border-glass)', paddingBottom: '1px', marginBottom: '24px' }}>
-          {(['dashboard', 'results', 'charts', 'report'] as const).map((tab) => {
+          {(['dashboard', 'smart_money', 'scheduler', 'monitor', 'results', 'charts', 'report'] as const).map((tab) => {
             const icons: Record<ActiveTab, React.ReactNode> = {
               dashboard: <LayoutDashboard size={16} />,
+              smart_money: <Compass size={16} />,
+              scheduler: <Clock size={16} />,
+              monitor: <BellRing size={16} />,
               results: <Database size={16} />,
               charts: <BarChart3 size={16} />,
               report: <FileText size={16} />,
             };
             const labels: Record<ActiveTab, string> = {
               dashboard: 'Dashboard Run',
+              smart_money: 'Smart Money & Commodity',
+              scheduler: 'Auto-Run Scheduler',
+              monitor: 'Telegram Monitor',
               results: 'Results Explorer',
               charts: 'Charts & Analisis',
               report: 'Laporan Analis AI',
             };
-            if (tab !== 'dashboard' && !selectedRunId) return null;
+            if (tab !== 'dashboard' && tab !== 'smart_money' && tab !== 'scheduler' && tab !== 'monitor' && !selectedRunId) return null;
             return (
               <button
                 key={tab}
@@ -238,13 +266,32 @@ export default function App() {
         {/* Tab Contents */}
         <div style={{ marginTop: '12px' }}>
           {activeTab === 'dashboard' && (
-            <ProgressVisualizer
-              status={pipelineStatus}
-              progress={pipelineProgress}
-              currentStage={pipelineCurrentStage}
-              error={pipelineError}
-              logs={pipelineLogs}
-            />
+            <>
+              {selectedRunId && !isRunning && (
+                <RecommendationPanel
+                  pack={recommendationPack}
+                  audit={runAudit}
+                  loading={recommendationLoading}
+                  error={recommendationError}
+                />
+              )}
+              <ProgressVisualizer
+                status={pipelineStatus}
+                progress={pipelineProgress}
+                currentStage={pipelineCurrentStage}
+                error={pipelineError}
+                logs={pipelineLogs}
+              />
+            </>
+          )}
+          {activeTab === 'smart_money' && (
+            <SmartMoneyScanner />
+          )}
+          {activeTab === 'scheduler' && (
+            <SchedulerPanel />
+          )}
+          {activeTab === 'monitor' && (
+            <LiveMonitorPanel />
           )}
           {activeTab === 'results' && selectedRunId && (
             <ResultsTable runId={selectedRunId} />

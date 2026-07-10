@@ -87,6 +87,12 @@ UNIVERSE_PRESETS = [
         "pefindo25.txt",
         "Preset PEFINDO25 lokal.",
     ),
+    UniversePreset(
+        "bandar",
+        "Smart Money / Bandar (7D)",
+        None,
+        "Daftar saham hasil akumulasi oleh broker asing/institusi dari scan terakhir.",
+    ),
 ]
 
 UNIVERSE_BY_KEY = {preset.key: preset for preset in UNIVERSE_PRESETS}
@@ -109,8 +115,35 @@ def read_universe_text(key: str) -> str:
 
 
 def load_universe_tickers(key: str) -> list[str]:
+    if key == "bandar":
+        csv_path = Path("data/output/bandar_scan_results.csv")
+        from datetime import date
+        is_today = False
+        if csv_path.exists():
+            try:
+                mtime = csv_path.stat().st_mtime
+                mdate = date.fromtimestamp(mtime)
+                if mdate == date.today():
+                    is_today = True
+            except Exception:
+                pass
+                
+        if not is_today:
+            from .bandar_tracker import run_bandar_scan
+            try:
+                run_bandar_scan("config/bandar_tracker.json", csv_path)
+            except Exception:
+                pass
+        try:
+            import pandas as pd
+            df = pd.read_csv(csv_path)
+            return df["ticker"].tolist()
+        except Exception:
+            return []
+            
     preset = get_universe_preset(key)
     if preset.path is None:
         return []
     return load_tickers(preset.path)
+
 

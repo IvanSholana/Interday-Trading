@@ -16,15 +16,37 @@ import {
   Legend
 } from 'recharts';
 import { TrendingUp, Award, AlertTriangle, Activity, Percent, Landmark } from 'lucide-react';
+import type { RunCsvResponse, RunCsvRow } from '../types/api';
 
 interface ChartsDashboardProps {
   runId: string;
 }
 
+interface TradeMetrics {
+  total_trades: number;
+  wins_count: number;
+  losses_count: number;
+  win_rate: number;
+  net_profit: number;
+  avg_return: number;
+}
+
+interface TradeBarDatum {
+  ticker: string;
+  profit: number;
+  profit_pct: number;
+}
+
+const toNumber = (value: RunCsvRow[string] | undefined): number => {
+  if (value === undefined || value === null || value === '') return 0;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
 export const ChartsDashboard: React.FC<ChartsDashboardProps> = ({ runId }) => {
-  const [metrics, setMetrics] = useState<any>(null);
-  const [equityData, setEquityData] = useState<any[]>([]);
-  const [trades, setTrades] = useState<any[]>([]);
+  const [metrics, setMetrics] = useState<TradeMetrics | null>(null);
+  const [equityData, setEquityData] = useState<RunCsvRow[]>([]);
+  const [trades, setTrades] = useState<RunCsvRow[]>([]);
   const [loading, setLoading] = useState(true);
 
   const fetchAnalytics = async () => {
@@ -68,22 +90,22 @@ export const ChartsDashboard: React.FC<ChartsDashboardProps> = ({ runId }) => {
       // Load equity curve
       const equityRes = await fetch(`/api/run-csv/${runId}/stage5_equity?limit=1000`);
       if (equityRes.ok) {
-        const eqResult = await equityRes.json();
+        const eqResult: RunCsvResponse = await equityRes.json();
         setEquityData(eqResult.records || []);
       }
       
       // Load trades log
       const tradesRes = await fetch(`/api/run-csv/${runId}/stage5_trades?limit=1000`);
       if (tradesRes.ok) {
-        const trResult = await tradesRes.json();
+        const trResult: RunCsvResponse = await tradesRes.json();
         const trRecords = trResult.records || [];
         setTrades(trRecords);
         
         // Recalculate metrics from trades if needed
         if (trRecords.length > 0) {
-          const wins = trRecords.filter((t: any) => parseFloat(t.return_pct || t.net_profit_pct || 0) > 0);
-          const losses = trRecords.filter((t: any) => parseFloat(t.return_pct || t.net_profit_pct || 0) <= 0);
-          const totalProfit = trRecords.reduce((acc: number, t: any) => acc + parseFloat(t.net_profit || 0), 0);
+          const wins = trRecords.filter((t) => toNumber(t.return_pct || t.net_profit_pct) > 0);
+          const losses = trRecords.filter((t) => toNumber(t.return_pct || t.net_profit_pct) <= 0);
+          const totalProfit = trRecords.reduce((acc, t) => acc + toNumber(t.net_profit), 0);
           
           setMetrics({
             total_trades: trRecords.length,
@@ -91,7 +113,7 @@ export const ChartsDashboard: React.FC<ChartsDashboardProps> = ({ runId }) => {
             losses_count: losses.length,
             win_rate: wins.length / trRecords.length,
             net_profit: totalProfit,
-            avg_return: trRecords.reduce((acc: number, t: any) => acc + parseFloat(t.return_pct || t.net_profit_pct || 0), 0) / trRecords.length
+            avg_return: trRecords.reduce((acc, t) => acc + toNumber(t.return_pct || t.net_profit_pct), 0) / trRecords.length
           });
         }
       }
@@ -125,12 +147,13 @@ export const ChartsDashboard: React.FC<ChartsDashboardProps> = ({ runId }) => {
     { name: 'Wins', value: metrics.wins_count, color: 'var(--color-success)' },
     { name: 'Losses', value: metrics.losses_count, color: 'var(--color-danger)' },
   ] : [];
+  const totalTradesForLegend = metrics?.total_trades || 0;
 
   // Prepare Bar chart data mapping profit of individual trades
-  const tradeBarData = trades.map((t, idx) => ({
-    ticker: t.ticker || `Trade ${idx + 1}`,
-    profit: parseFloat(t.net_profit || 0),
-    profit_pct: parseFloat(t.return_pct || t.net_profit_pct || 0) * 100
+  const tradeBarData: TradeBarDatum[] = trades.map((t, idx) => ({
+    ticker: String(t.ticker || `Trade ${idx + 1}`),
+    profit: toNumber(t.net_profit),
+    profit_pct: toNumber(t.return_pct || t.net_profit_pct) * 100
   })).slice(0, 20); // show top 20 for readability
 
   return (
@@ -231,7 +254,7 @@ export const ChartsDashboard: React.FC<ChartsDashboardProps> = ({ runId }) => {
                   <Tooltip
                     contentStyle={{ background: '#0b0f19', border: '1px solid var(--border-glass)', borderRadius: '8px' }}
                     labelStyle={{ color: 'white', fontWeight: 600 }}
-                    formatter={(val: any) => [formatIDR(val), 'Ekuitas']}
+                    formatter={(val: number | string) => [formatIDR(Number(val)), 'Ekuitas']}
                   />
                   <Area
                     type="monotone"
@@ -285,7 +308,7 @@ export const ChartsDashboard: React.FC<ChartsDashboardProps> = ({ runId }) => {
                     <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                       <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: entry.color }} />
                       <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                        {entry.name}: {entry.value} ({((entry.value / metrics.total_trades) * 100).toFixed(0)}%)
+                        {entry.name}: {entry.value} ({totalTradesForLegend > 0 ? ((entry.value / totalTradesForLegend) * 100).toFixed(0) : '0'}%)
                       </span>
                     </div>
                   ))}
@@ -319,7 +342,7 @@ export const ChartsDashboard: React.FC<ChartsDashboardProps> = ({ runId }) => {
                 <Tooltip
                   contentStyle={{ background: '#0b0f19', border: '1px solid var(--border-glass)', borderRadius: '8px' }}
                   labelStyle={{ color: 'white', fontWeight: 600 }}
-                  formatter={(val: any) => [`${val.toFixed(2)}%`, 'Return']}
+                  formatter={(val: number | string) => [`${Number(val).toFixed(2)}%`, 'Return']}
                 />
                 <ReferenceLine y={0} stroke="rgba(255,255,255,0.2)" />
                 <Bar dataKey="profit_pct" radius={[4, 4, 0, 0]}>

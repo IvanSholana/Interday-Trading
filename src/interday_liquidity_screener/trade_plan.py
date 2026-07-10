@@ -21,7 +21,193 @@ ACTIVE_TECHNICAL_CONTEXTS = {
     "UPTREND_CONTINUATION",
     "VOLUME_SPIKE",
     "EARLY_REVERSAL_ATTEMPT",
+    "SIDEWAYS_COMPRESSION",
 }
+
+_FUNNEL_COUNTS: dict[str, int] = {}
+
+def reset_funnel_counts() -> None:
+    global _FUNNEL_COUNTS
+    _FUNNEL_COUNTS = {
+        "total_inputs": 0,
+        "pre_gate_is_data_valid_fail": 0,
+        "pre_gate_is_bandar_path": 0,
+        # Bandar path
+        "bandar_liquidity_bucket_fail": 0,
+        "bandar_watch_eligible_fail": 0,
+        "bandar_technical_context_invalid_fail": 0,
+        "bandar_technical_context_too_volatile_fail": 0,
+        "bandar_technical_context_too_quiet_fail": 0,
+        "bandar_broker_data_unavailable_fail": 0,
+        "bandar_distribution_fail": 0,
+        "bandar_short_term_against_medium_watch": 0,
+        "bandar_pullback_with_medium_acc_watch": 0,
+        "bandar_neutral_flow_fail": 0,
+        "bandar_low_score_fail": 0,
+        "bandar_no_accumulation_fail": 0,
+        "bandar_position_too_small_fail": 0,
+        "bandar_weak_but_liquid_watch": 0,
+        "bandar_inactive_technical_context_fail": 0,
+        "bandar_orderbook_status_fail": 0,
+        "bandar_pre_gate_pass": 0,
+        # Non-Bandar path
+        "non_bandar_entry_setup_fail": 0,
+        "non_bandar_watch_eligible_fail": 0,
+        "non_bandar_technical_context_fail": 0,
+        "non_bandar_position_too_small_fail": 0,
+        "non_bandar_pre_gate_pass": 0,
+        # Trade status gate
+        "trade_gate_inputs": 0,
+        "trade_gate_atr_pct_fail": 0,
+        "trade_gate_invalid_stop_fail": 0,
+        "trade_gate_stop_too_wide_fail": 0,
+        "trade_gate_non_bandar_volume_fail": 0,
+        "trade_gate_non_bandar_rebound_fail": 0,
+        "trade_gate_non_bandar_activity_fail": 0,
+        "trade_gate_non_bandar_pullback_fail": 0,
+        "trade_gate_bad_rr_tp1_fail": 0,
+        "trade_gate_bad_rr_tp2_fail": 0,
+        "trade_gate_position_size_lots_fail": 0,
+        "trade_gate_pending_orderbook_draft": 0,
+        "trade_gate_pass_valid_plan": 0,
+    }
+
+def _inc_funnel(key: str) -> None:
+    global _FUNNEL_COUNTS
+    if key not in _FUNNEL_COUNTS:
+        _FUNNEL_COUNTS[key] = 0
+    _FUNNEL_COUNTS[key] += 1
+
+def print_funnel_summary_report() -> None:
+    global _FUNNEL_COUNTS
+    if not _FUNNEL_COUNTS or _FUNNEL_COUNTS.get("total_inputs", 0) == 0:
+        return
+
+    print("=" * 60)
+    print("STAGE 4 FUNNEL REJECTION ANALYSIS REPORT")
+    print("=" * 60)
+    total = _FUNNEL_COUNTS["total_inputs"]
+    print(f"Total Tickers Input: {total}")
+    print(f"  - Invalid Data (Stage 2): {_FUNNEL_COUNTS.get('pre_gate_is_data_valid_fail', 0)}")
+    
+    # Bandar Path
+    bandar_total = _FUNNEL_COUNTS.get("pre_gate_is_bandar_path", 0)
+    print(f"\nBandar Path: {bandar_total} tickers")
+    if bandar_total > 0:
+        rem = bandar_total
+        print(f"  [Start] {rem} tickers")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_liquidity_bucket_fail", 0)
+        print(f"  -> Liquidity Bucket (HIGH/GOOD): {rem} (filtered {_FUNNEL_COUNTS.get('bandar_liquidity_bucket_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_watch_eligible_fail", 0)
+        print(f"  -> Bandar Watch Eligible: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_watch_eligible_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_technical_context_invalid_fail", 0)
+        print(f"  -> Technical Context Valid: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_technical_context_invalid_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_technical_context_too_volatile_fail", 0)
+        print(f"  -> Technical Volatility <= Limit: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_technical_context_too_volatile_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_technical_context_too_quiet_fail", 0)
+        print(f"  -> Technical Activity Not Too Quiet: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_technical_context_too_quiet_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_broker_data_unavailable_fail", 0)
+        print(f"  -> Broker Data Available: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_broker_data_unavailable_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_distribution_fail", 0)
+        print(f"  -> Not Distribution (STRONG/MILD): {rem} (filtered {_FUNNEL_COUNTS.get('bandar_distribution_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_short_term_against_medium_watch", 0)
+        print(f"  -> Short term vs Medium distribution watch: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_short_term_against_medium_watch', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_pullback_with_medium_acc_watch", 0)
+        print(f"  -> Pullback with medium accumulation watch: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_pullback_with_medium_acc_watch', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_neutral_flow_fail", 0)
+        print(f"  -> Not Neutral Flow: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_neutral_flow_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_low_score_fail", 0)
+        print(f"  -> Score >= Min Score: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_low_score_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_no_accumulation_fail", 0)
+        print(f"  -> Accumulation confirmed: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_no_accumulation_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_position_too_small_fail", 0)
+        print(f"  -> Affordable minimum lot: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_position_too_small_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_weak_but_liquid_watch", 0)
+        print(f"  -> Bandar Accumulation (Weak Technical): {rem} (filtered {_FUNNEL_COUNTS.get('bandar_weak_but_liquid_watch', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_inactive_technical_context_fail", 0)
+        print(f"  -> Whitelisted active tech context: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_inactive_technical_context_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("bandar_orderbook_status_fail", 0)
+        print(f"  -> Orderbook confirmation check: {rem} (filtered {_FUNNEL_COUNTS.get('bandar_orderbook_status_fail', 0)})")
+        
+        print(f"  -> Passed Pre-gate: {_FUNNEL_COUNTS.get('bandar_pre_gate_pass', 0)}")
+
+    # Non-Bandar Path
+    non_bandar_total = total - _FUNNEL_COUNTS.get("pre_gate_is_data_valid_fail", 0) - bandar_total
+    print(f"\nNon-Bandar Path: {non_bandar_total} tickers")
+    if non_bandar_total > 0:
+        rem = non_bandar_total
+        print(f"  [Start] {rem} tickers")
+        
+        rem -= _FUNNEL_COUNTS.get("non_bandar_entry_setup_fail", 0)
+        print(f"  -> Actionable entry setup: {rem} (filtered {_FUNNEL_COUNTS.get('non_bandar_entry_setup_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("non_bandar_watch_eligible_fail", 0)
+        print(f"  -> Watch Eligible: {rem} (filtered {_FUNNEL_COUNTS.get('non_bandar_watch_eligible_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("non_bandar_technical_context_fail", 0)
+        print(f"  -> Technical Context Valid: {rem} (filtered {_FUNNEL_COUNTS.get('non_bandar_technical_context_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("non_bandar_position_too_small_fail", 0)
+        print(f"  -> Affordable minimum lot: {rem} (filtered {_FUNNEL_COUNTS.get('non_bandar_position_too_small_fail', 0)})")
+        
+        print(f"  -> Passed Pre-gate: {_FUNNEL_COUNTS.get('non_bandar_pre_gate_pass', 0)}")
+
+    # Trade Status Gate
+    trade_inputs = _FUNNEL_COUNTS.get("trade_gate_inputs", 0)
+    print(f"\nTrade Status Evaluation: {trade_inputs} tickers entered")
+    if trade_inputs > 0:
+        rem = trade_inputs
+        print(f"  [Start] {rem} tickers")
+        
+        rem -= _FUNNEL_COUNTS.get("trade_gate_atr_pct_fail", 0)
+        print(f"  -> Volatility ATR % <= 7%: {rem} (filtered {_FUNNEL_COUNTS.get('trade_gate_atr_pct_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("trade_gate_invalid_stop_fail", 0)
+        print(f"  -> Stop Loss Valid (< Entry): {rem} (filtered {_FUNNEL_COUNTS.get('trade_gate_invalid_stop_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("trade_gate_stop_too_wide_fail", 0)
+        print(f"  -> Stop Loss Risk <= Max Allowed: {rem} (filtered {_FUNNEL_COUNTS.get('trade_gate_stop_too_wide_fail', 0)})")
+        
+        # Non-Bandar specifics
+        non_bandar_rejections = (
+            _FUNNEL_COUNTS.get("trade_gate_non_bandar_volume_fail", 0) +
+            _FUNNEL_COUNTS.get("trade_gate_non_bandar_rebound_fail", 0) +
+            _FUNNEL_COUNTS.get("trade_gate_non_bandar_activity_fail", 0) +
+            _FUNNEL_COUNTS.get("trade_gate_non_bandar_pullback_fail", 0)
+        )
+        rem -= non_bandar_rejections
+        print(f"  -> Non-Bandar volume/setup triggers: {rem} (filtered sum of non-bandar volume, rebound, activity, pullback filters)")
+        
+        rem -= _FUNNEL_COUNTS.get("trade_gate_bad_rr_tp1_fail", 0)
+        print(f"  -> Risk/Reward TP1 >= Threshold: {rem} (filtered {_FUNNEL_COUNTS.get('trade_gate_bad_rr_tp1_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("trade_gate_bad_rr_tp2_fail", 0)
+        print(f"  -> Risk/Reward TP2 >= Threshold: {rem} (filtered {_FUNNEL_COUNTS.get('trade_gate_bad_rr_tp2_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("trade_gate_position_size_lots_fail", 0)
+        print(f"  -> Theoretical Position Size >= 1 lot: {rem} (filtered {_FUNNEL_COUNTS.get('trade_gate_position_size_lots_fail', 0)})")
+        
+        rem -= _FUNNEL_COUNTS.get("trade_gate_pending_orderbook_draft", 0)
+        print(f"  -> Orderbook confirmed (not pending): {rem} (filtered/draft pending {_FUNNEL_COUNTS.get('trade_gate_pending_orderbook_draft', 0)})")
+        
+        print(f"  -> VALID TRADE PLANS: {_FUNNEL_COUNTS.get('trade_gate_pass_valid_plan', 0)}")
+    print("=" * 60)
 
 IDX_TICK_TABLE = [
     {"min_price": 0, "max_price": 200, "tick": 1},
@@ -236,7 +422,7 @@ class TradePlanConfig:
             "interday": {
                 "tp1_pct": 0.05,
                 "tp2_pct": 0.08,
-                "max_stop_loss_pct": 0.06,
+                "max_stop_loss_pct": 0.08,
                 "time_stop_days": 10,
                 "require_orderbook_confirmation": False,
                 "force_exit_same_day": False,
@@ -660,6 +846,10 @@ def _status_reason_summary(status: str) -> tuple[str, str]:
             "rejected_because_uma_or_special_notation_risk",
             "Orderbook has UMA or special notation risk. Do not execute by default.",
         ),
+        "COMMODITY_HEADWIND": (
+            "watching_because_commodity_headwind_is_active",
+            "The underlying global commodity is down heavily. Avoid buying this ticker now.",
+        ),
         "REJECT_CORPORATE_ACTION_RISK": (
             "rejected_because_corporate_action_risk",
             "Corporate action risk is present. Do not execute by default.",
@@ -789,59 +979,84 @@ def _orderbook_trade_status(row: dict[str, Any] | pd.Series, config: TradePlanCo
 
 
 def validate_pre_plan_gate(result: dict[str, Any], config: TradePlanConfig) -> str | None:
+    _inc_funnel("total_inputs")
     if not _bool_value(result.get("is_data_valid")):
+        _inc_funnel("pre_gate_is_data_valid_fail")
         return "INVALID_DATA"
 
     has_bandar_columns = _has_bandarmology_context(result)
     if has_bandar_columns:
+        _inc_funnel("pre_gate_is_bandar_path")
         if result.get("liquidity_bucket") not in {"HIGH_LIQUIDITY", "GOOD_LIQUIDITY"}:
+            _inc_funnel("bandar_liquidity_bucket_fail")
             return "SKIPPED_NOT_TRADE_CANDIDATE"
         if not _bool_value(result.get("bandar_watch_eligible")):
+            _inc_funnel("bandar_watch_eligible_fail")
             return "SKIPPED_NOT_TRADE_CANDIDATE"
         technical_context = result.get("technical_context")
         if technical_context == "INVALID_DATA":
+            _inc_funnel("bandar_technical_context_invalid_fail")
             return "INVALID_DATA"
         if technical_context == "TOO_VOLATILE":
+            _inc_funnel("bandar_technical_context_too_volatile_fail")
             return "REJECT_TOO_VOLATILE"
         if technical_context == "TOO_QUIET_ABSOLUTE":
+            _inc_funnel("bandar_technical_context_too_quiet_fail")
             return "SKIPPED_NOT_TRADE_CANDIDATE"
 
         broker_available = _bool_value(result.get("broker_activity_available"))
         signal = result.get("bandarmology_signal")
         score = _value(result, "bandarmology_score")
         if (not broker_available or signal == "NO_BROKER_DATA") and not config.allow_trade_without_broker_data:
+            _inc_funnel("bandar_broker_data_unavailable_fail")
             return "SKIPPED_NO_BROKER_DATA"
         if broker_available and signal in {"STRONG_DISTRIBUTION", "MILD_DISTRIBUTION"}:
+            _inc_funnel("bandar_distribution_fail")
             return "SKIPPED_NO_BANDAR_CONFIRMATION"
         if broker_available and signal == "SHORT_TERM_ACCUMULATION_AGAINST_MEDIUM_DISTRIBUTION":
+            _inc_funnel("bandar_short_term_against_medium_watch")
             return "WATCH_SHORT_TERM_ACCUMULATION_AGAINST_DISTRIBUTION"
         if broker_available and signal == "PULLBACK_WITH_MEDIUM_ACCUMULATION":
+            _inc_funnel("bandar_pullback_with_medium_acc_watch")
             return "WATCH_PULLBACK_WITH_MEDIUM_ACCUMULATION"
         if broker_available and signal == "NEUTRAL_FLOW":
+            _inc_funnel("bandar_neutral_flow_fail")
             return "SKIPPED_LOW_BANDARMOLOGY_SCORE"
         if broker_available and score < config.bandarmology_min_score:
+            _inc_funnel("bandar_low_score_fail")
             return "SKIPPED_LOW_BANDARMOLOGY_SCORE"
         if broker_available and signal not in {"STRONG_ACCUMULATION", "MILD_ACCUMULATION"}:
+            _inc_funnel("bandar_no_accumulation_fail")
             return "SKIPPED_NO_BANDAR_CONFIRMATION"
         if not can_afford_minimum_lot(result, config):
+            _inc_funnel("bandar_position_too_small_fail")
             return "REJECT_POSITION_TOO_SMALL"
         if technical_context == "TECHNICALLY_WEAK_BUT_LIQUID":
+            _inc_funnel("bandar_weak_but_liquid_watch")
             return "WATCH_BANDAR_ACCUMULATION_WAIT_TECHNICAL_TRIGGER"
         if technical_context not in ACTIVE_TECHNICAL_CONTEXTS:
+            _inc_funnel("bandar_inactive_technical_context_fail")
             return "SKIPPED_NOT_TRADE_CANDIDATE"
         orderbook_status = _orderbook_trade_status(result, config)
         if orderbook_status is not None:
+            _inc_funnel("bandar_orderbook_status_fail")
             return orderbook_status
+        _inc_funnel("bandar_pre_gate_pass")
     else:
         setup = result.get("entry_setup")
         if setup not in ACTIONABLE_SETUPS:
+            _inc_funnel("non_bandar_entry_setup_fail")
             return "SKIPPED_NOT_TRADE_CANDIDATE"
         if "bandar_watch_eligible" in result and not _bool_value(result.get("bandar_watch_eligible")):
+            _inc_funnel("non_bandar_watch_eligible_fail")
             return "SKIPPED_NOT_TRADE_CANDIDATE"
         if result.get("technical_context") in {"TOO_VOLATILE", "TOO_QUIET_ABSOLUTE", "INVALID_DATA"}:
+            _inc_funnel("non_bandar_technical_context_fail")
             return "SKIPPED_NOT_TRADE_CANDIDATE"
         if not can_afford_minimum_lot(result, config):
+            _inc_funnel("non_bandar_position_too_small_fail")
             return "REJECT_POSITION_TOO_SMALL"
+        _inc_funnel("non_bandar_pre_gate_pass")
     return None
 
 
@@ -850,16 +1065,20 @@ def validate_trade_status(result: dict[str, Any], config: TradePlanConfig) -> st
     if pre_plan_status is not None:
         return pre_plan_status
 
+    _inc_funnel("trade_gate_inputs")
     has_bandar_columns = _has_bandarmology_context(result)
-    if _value(result, "atr_pct") > 0.06:
+    if _value(result, "atr_pct") > 0.07:
+        _inc_funnel("trade_gate_atr_pct_fail")
         return "REJECT_TOO_VOLATILE"
 
     entry_price = _value(result, "entry_price")
     stop_loss = _value(result, "stop_loss")
     if entry_price <= 0 or stop_loss <= 0 or stop_loss >= entry_price:
+        _inc_funnel("trade_gate_invalid_stop_fail")
         return "REJECT_INVALID_STOP"
 
     if _value(result, "risk_pct") > config.max_stop_loss_pct:
+        _inc_funnel("trade_gate_stop_too_wide_fail")
         return "REJECT_STOP_TOO_WIDE"
 
     setup = _plan_setup(result)
@@ -868,27 +1087,36 @@ def validate_trade_status(result: dict[str, Any], config: TradePlanConfig) -> st
     volume_ratio = _value(result, "volume_ratio")
     if not has_bandar_columns:
         if setup == "BREAKOUT_CANDIDATE" and value_ratio < 1.0 and volume_ratio < 1.0:
+            _inc_funnel("trade_gate_non_bandar_volume_fail")
             return "WAIT_FOR_VOLUME_CONFIRMATION"
         if setup == "REBOUND_CANDIDATE" and relative_activity not in {"NORMAL", "NORMAL_TO_QUIET", "ACTIVE", "VERY_ACTIVE"}:
+            _inc_funnel("trade_gate_non_bandar_rebound_fail")
             return "WAIT_FOR_REBOUND_CONFIRMATION"
         if relative_activity == "QUIET":
+            _inc_funnel("trade_gate_non_bandar_activity_fail")
             return "WAIT_FOR_ACTIVITY"
         if setup == "PULLBACK_CANDIDATE" and abs(_value(result, "distance_to_ma20")) > 0.03:
+            _inc_funnel("trade_gate_non_bandar_pullback_fail")
             return "WAIT_FOR_PULLBACK"
 
     min_rr_tp1 = config.rebound_min_rr_tp1 if setup == "REBOUND_CANDIDATE" else config.min_rr_tp1
     min_rr_tp2 = config.rebound_min_rr_tp2 if setup == "REBOUND_CANDIDATE" else config.min_rr_tp2
     if _value(result, "risk_reward_tp1") < min_rr_tp1:
+        _inc_funnel("trade_gate_bad_rr_tp1_fail")
         return "REJECT_BAD_RISK_REWARD_TP1"
     if _value(result, "risk_reward_tp2") < min_rr_tp2:
+        _inc_funnel("trade_gate_bad_rr_tp2_fail")
         return "REJECT_BAD_RISK_REWARD_TP2"
 
     if _value(result, "theoretical_position_size_lots") < 1:
+        _inc_funnel("trade_gate_position_size_lots_fail")
         return "REJECT_POSITION_TOO_SMALL"
 
     if _bool_value(result.get("orderbook_confirmation_required")) and result.get("orderbook_status") == "NOT_CHECKED":
+        _inc_funnel("trade_gate_pending_orderbook_draft")
         return "DRAFT_PLAN_PENDING_ORDERBOOK"
 
+    _inc_funnel("trade_gate_pass_valid_plan")
     return "VALID_TRADE_PLAN"
 
 
@@ -1106,6 +1334,7 @@ def run_stage_3_trade_plan(
     output_path: str | Path,
     config: TradePlanConfig | None = None,
 ) -> pd.DataFrame:
+    reset_funnel_counts()
     config = config or TradePlanConfig()
     candidates = load_stage_2_candidates(input_path)
     print(f"Stage 2 rows loaded: {len(candidates)}")
@@ -1138,6 +1367,7 @@ def run_stage_3_trade_plan(
     ]:
         print(f"{status:30s}: {counts.get(status, 0)}")
     print(f"Output saved to: {path}")
+    print_funnel_summary_report()
     return output
 
 
@@ -1148,6 +1378,7 @@ def run_stage_4_trade_plan(
     config: TradePlanConfig | None = None,
     orderbook_path: str | Path | None = None,
 ) -> pd.DataFrame:
+    reset_funnel_counts()
     config = config or TradePlanConfig()
     candidates = _merge_stage2_bandarmology(stage2_path, bandarmology_path)
     candidates = _merge_orderbook(candidates, orderbook_path)
@@ -1179,4 +1410,5 @@ def run_stage_4_trade_plan(
     print(f"Skipped low bandarmology score: {counts.get('SKIPPED_LOW_BANDARMOLOGY_SCORE', 0)}")
     print(f"Rejected risk/reward: {rejected_rr}")
     print(f"Output saved to: {path}")
+    print_funnel_summary_report()
     return output

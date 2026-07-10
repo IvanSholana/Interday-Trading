@@ -186,6 +186,27 @@ def build_parser() -> argparse.ArgumentParser:
     stage6.add_argument("--run-date", required=True)
     stage6.add_argument("--max-candidates", type=int, default=30)
     stage6.add_argument("--dry-run", action="store_true")
+
+    scheduler = subparsers.add_parser("scheduler", help="Run flexible automated pipeline scheduler daemon.")
+    scheduler.add_argument("--config", default="config/schedule.json", help="Path to schedule JSON config.")
+    scheduler.add_argument("--one-shot", action="store_true", help="Run all tasks immediately once and exit.")
+    scheduler.add_argument("--check-interval", type=float, default=30.0, help="Daemon check interval in seconds.")
+
+    monitor = subparsers.add_parser("monitor", help="Run live market monitor for watchlist candidates.")
+    monitor.add_argument("--watchlist", default="data/output/stage4_today.csv", help="Path to watchlist CSV.")
+    monitor.add_argument("--output", default="data/output/live_monitor_status.json", help="Path to write JSON status output.")
+    monitor.add_argument("--interval", type=float, default=300.0, help="Scan interval in seconds (default: 300s).")
+    monitor.add_argument("--bypass-market-hours", action="store_true", help="Bypass market hours check for testing.")
+
+    scan_bandar = subparsers.add_parser("scan-bandar", help="Scan and track smart money (bandar) accumulation flow.")
+    scan_bandar.add_argument("--config", default="config/bandar_tracker.json", help="Path to bandar tracker JSON config.")
+    scan_bandar.add_argument("--output", default="data/output/bandar_scan_results.csv", help="Path to output candidates CSV.")
+    scan_bandar.add_argument("--investor-type", help="Override investor type to track.")
+    scan_bandar.add_argument("--period", help="Override tracking period.")
+    scan_bandar.add_argument("--force-refresh", action="store_true", help="Force refresh and bypass daily cache.")
+
+
+
     return parser
 
 
@@ -323,6 +344,40 @@ def main() -> None:
             args.max_candidates,
         )
         run_llm_report(args.evidence_output, args.report_output, args.ranking_output, args.watchlist_output, args.raw_output, args.strategy_mode, dry_run=args.dry_run)
+    elif args.command == "scheduler":
+        from interday_liquidity_screener.scheduler import PipelineScheduler
+        sched = PipelineScheduler(args.config)
+        if args.one_shot:
+            sched.check_and_run(one_shot=True)
+        else:
+            sched.start_loop(check_interval_seconds=args.check_interval)
+    elif args.command == "monitor":
+        from interday_liquidity_screener.monitor import LiveTickerMonitor
+        mon = LiveTickerMonitor(watchlist_path=args.watchlist, status_output_path=args.output)
+        mon.start_monitoring_loop(interval_seconds=args.interval, bypass_market_hours=args.bypass_market_hours)
+    elif args.command == "scan-bandar":
+        from interday_liquidity_screener.bandar_tracker import run_bandar_scan
+        print("\n=== Running Bandar Tracker (Smart Money Scan) ===")
+        df = run_bandar_scan(
+            config_path=args.config,
+            output_path=args.output,
+            force_refresh=args.force_refresh,
+            override_investor_type=args.investor_type,
+            override_period=args.period
+        )
+        if df.empty:
+            print("No candidates found or error occurred.")
+        else:
+            print(f"\nScan complete! Found {len(df)} accumulated tickers:")
+            df_disp = df.copy()
+            df_disp["net_buy_value_idr"] = df_disp["net_buy_value"].apply(
+                lambda val: f"Rp {val/1_000_000_000:.2f} B" if val >= 1_000_000_000 else f"Rp {val/1_000_000:.2f} M"
+            )
+            print(df_disp[["ticker", "net_buy_value_idr", "avg_price", "frequency", "corp_action_active", "special_notations"]].to_string(index=False))
+            print(f"\nSaved candidates list to: {args.output}")
+
+
+
 
 
 if __name__ == "__main__":

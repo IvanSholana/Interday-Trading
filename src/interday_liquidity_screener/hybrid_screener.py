@@ -8,6 +8,7 @@ import pandas as pd
 from .orderbook_filter import is_corp_action_active, is_notation_risky
 from .trade_plan import get_idx_tick_size, round_price_to_tick
 from .market_data_cache import MarketDataCache, DEFAULT_MARKET_DATA_DB, normalize_ohlcv_frame
+from .constants import WatchlistStatus
 from .hybrid_config import (
     HYBRID_MODES,
     OUTPUT_COLUMNS,
@@ -300,12 +301,26 @@ def score_market_regime(row: dict[str, Any]) -> ScoreResult:
 
 def score_sector_strength(row: dict[str, Any]) -> ScoreResult:
     score = _safe_float(_first(row, ["sector_strength_score", "sector_score"]))
+    warnings: list[str] = []
     if score is None:
-        return ScoreResult(50, ("sector_strength_unavailable_neutral_score",))
+        score = 50.0
+        warnings.append("sector_strength_unavailable_neutral_score")
     flags: list[str] = []
     if str(row.get("sector_regime", "")).upper() in {"DOWNTREND", "HARD_DOWNTREND"} or score < 30:
         flags.append("SECTOR_DOWNTREND")
-    return ScoreResult(_clip(score), flags=tuple(flags))
+        
+    symbol = row.get("symbol")
+    if symbol:
+        from .commodity_gate import evaluate_commodity_sentiment
+        try:
+            is_headwind, change_pct, comm_name = evaluate_commodity_sentiment(symbol)
+            if is_headwind:
+                score -= 20.0
+                flags.append("COMMODITY_HEADWIND")
+        except Exception:
+            pass
+            
+    return ScoreResult(_clip(score), warnings=tuple(warnings), flags=tuple(flags))
 
 
 def orderbook_available(row: dict[str, Any]) -> bool:
@@ -551,7 +566,11 @@ def stage0_safety(row: dict[str, Any], scores: dict[str, ScoreResult], risk: Ris
     if cfg.hard_skip_uma and _safe_bool(row.get("uma")):
         skip_reasons.append("SKIP_UMA")
     status_text = str(row.get("status", "")).lower()
-    if _safe_bool(row.get("suspended")) or "suspend" in status_text or not _safe_bool(row.get("tradable", True)):
+    tradable_val = row.get("tradable")
+    is_tradable = True
+    if tradable_val is not None and not pd.isna(tradable_val):
+        is_tradable = _safe_bool(tradable_val)
+    if _safe_bool(row.get("suspended")) or "suspend" in status_text or not is_tradable:
         skip_reasons.append("SKIP_NOT_TRADABLE")
     if cfg.hard_skip_special_notation and is_notation_risky(row.get("notation")):
         skip_reasons.append("SKIP_SPECIAL_NOTATION")
@@ -633,93 +652,104 @@ def determine_status(
     flow_source: str,
     mode: str,
     multibar_status: str = "CONFIRMED",
-) -> str:
+) -> WatchlistStatus:
     if multibar_status == "PENDING_CONFIRMATION":
-        return "SKIP"
+        return WatchlistStatus.SKIP
     if not row.get("symbol"):
-        return "DATA_INSUFFICIENT"
-    if "LOW_LIQUIDITY" in skip_reasons:
-        return "LOW_LIQUIDITY"
-    if "TOO_EXPENSIVE_FOR_CAPITAL" in skip_reasons:
-        return "TOO_EXPENSIVE_FOR_CAPITAL"
-    if "DANGER_CHASING" in skip_reasons:
-        return "DANGER_CHASING"
-    if "DISTRIBUTION_WARNING" in skip_reasons:
-        return "DISTRIBUTION_WARNING"
+        return WatchlistStatus.DATA_INSUFFICIENT
+    if WatchlistStatus.LOW_LIQUIDITY.value in skip_reasons:
+        return WatchlistStatus.LOW_LIQUIDITY
+    if WatchlistStatus.TOO_EXPENSIVE_FOR_CAPITAL.value in skip_reasons:
+        return WatchlistStatus.TOO_EXPENSIVE_FOR_CAPITAL
+    if WatchlistStatus.DANGER_CHASING.value in skip_reasons:
+        return WatchlistStatus.DANGER_CHASING
+    if WatchlistStatus.DISTRIBUTION_WARNING.value in skip_reasons:
+        return WatchlistStatus.DISTRIBUTION_WARNING
+    if "COMMODITY_HEADWIND" in scores["sector_strength"].flags:
+        return WatchlistStatus.COMMODITY_HEADWIND
+    
+    # Smart Money Watch Path: strong accumulation but no technical trigger
+    if scores["smart_money"].score >= 70 and scores["technical"].score < 60:
+        if scores["technical"].score >= 45:
+            return WatchlistStatus.READY_SOON
+        return WatchlistStatus.EARLY_WATCH
+
     hard_safety = [reason for reason in skip_reasons if reason.startswith("SKIP_")]
     if hard_safety:
-        return "SKIP"
+        return WatchlistStatus.SKIP
     has_orderbook = orderbook_available(row)
     orderbook_flags = set(scores["orderbook"].flags)
     risk_flags = set(risk.skip_reasons)
     if mode == "smart_money_first":
         if scores["smart_money"].score >= 70 and scores["price_extension"].score >= 70 and scores["technical"].score >= 55:
-            return "READY_SOON"
+            return WatchlistStatus.READY_SOON
         if scores["smart_money"].score >= 60 and scores["price_extension"].score >= 65:
-            return "EARLY_WATCH"
-        return "SKIP"
+            return WatchlistStatus.EARLY_WATCH
+        return WatchlistStatus.SKIP
     if mode == "weekend_preparation":
         if scores["smart_money"].score >= 70 and scores["technical"].score >= 60 and risk.risk_plan_score >= 55:
-            return "READY_SOON"
+            return WatchlistStatus.READY_SOON
         if scores["smart_money"].score >= 60 or flow_source in {"safe_execution", "smart_money_discovery", "both"}:
-            return "EARLY_WATCH"
-        return "SKIP"
+            return WatchlistStatus.EARLY_WATCH
+        return WatchlistStatus.SKIP
     if flow_source == "none":
-        return "SKIP"
-    if "NET_PROFIT_NOT_WORTH_IT" in risk_flags:
-        return "NET_PROFIT_NOT_WORTH_IT"
-    if "RISK_REWARD_BAD" in risk_flags:
-        return "RISK_REWARD_BAD"
+        return WatchlistStatus.SKIP
+    if WatchlistStatus.NET_PROFIT_NOT_WORTH_IT.value in risk_flags:
+        return WatchlistStatus.NET_PROFIT_NOT_WORTH_IT
+    if WatchlistStatus.RISK_REWARD_BAD.value in risk_flags:
+        return WatchlistStatus.RISK_REWARD_BAD
     if mode == "bpjs_live":
         if not has_orderbook:
-            return "NEED_ORDERBOOK"
-        if "ORDERBOOK_REJECT" in orderbook_flags:
-            return "ORDERBOOK_REJECT"
-        if "ORDERBOOK_WEAK" in orderbook_flags or scores["orderbook"].score < 55:
-            return "ORDERBOOK_WEAK"
-        return "EXECUTION_READY"
+            return WatchlistStatus.NEED_ORDERBOOK
+        if WatchlistStatus.ORDERBOOK_REJECT.value in orderbook_flags:
+            return WatchlistStatus.ORDERBOOK_REJECT
+        if WatchlistStatus.ORDERBOOK_WEAK.value in orderbook_flags or scores["orderbook"].score < 55:
+            return WatchlistStatus.ORDERBOOK_WEAK
+        return WatchlistStatus.EXECUTION_READY
     if has_orderbook:
-        if "ORDERBOOK_REJECT" in orderbook_flags:
-            return "ORDERBOOK_REJECT"
-        if "ORDERBOOK_WEAK" in orderbook_flags or scores["orderbook"].score < 45:
-            return "ORDERBOOK_WEAK"
-        return "EXECUTION_READY"
+        if WatchlistStatus.ORDERBOOK_REJECT.value in orderbook_flags:
+            return WatchlistStatus.ORDERBOOK_REJECT
+        if WatchlistStatus.ORDERBOOK_WEAK.value in orderbook_flags or scores["orderbook"].score < 45:
+            return WatchlistStatus.ORDERBOOK_WEAK
+        return WatchlistStatus.EXECUTION_READY
     if mode == "normal_execution":
-        return "EXECUTION_DRAFT"
-    return "EXECUTION_CANDIDATE"
+        return WatchlistStatus.EXECUTION_DRAFT
+    return WatchlistStatus.EXECUTION_CANDIDATE
 
 
 def build_explanation(status: str, scores: dict[str, ScoreResult], risk: RiskPlan, flow_source: str, warnings: list[str], skip_reasons: list[str]) -> str:
-    if status == "READY_SOON":
+    if status == WatchlistStatus.READY_SOON:
         return "READY_SOON because smart money and technical structure are improving, price is not extended, but execution still needs live validation."
-    if status == "EARLY_WATCH":
+    if status == WatchlistStatus.EARLY_WATCH:
         return "EARLY_WATCH because the stock is worth monitoring, but the setup is not yet an execution signal."
-    if status == "NEED_ORDERBOOK":
+    if status == WatchlistStatus.NEED_ORDERBOOK:
         return "NEED_ORDERBOOK because BPJS live mode requires a live orderbook before any execution-ready status is allowed."
-    if status == "EXECUTION_DRAFT":
+    if status == WatchlistStatus.EXECUTION_DRAFT:
         return "EXECUTION_DRAFT because pre-market scores are acceptable, but live orderbook validation has not been supplied."
-    if status == "EXECUTION_CANDIDATE":
+    if status == WatchlistStatus.EXECUTION_CANDIDATE:
         return "EXECUTION_CANDIDATE because liquidity, setup, smart money, extension, and risk gates are acceptable before final live validation."
-    if status == "EXECUTION_READY":
+    if status == WatchlistStatus.EXECUTION_READY:
         return "EXECUTION_READY because the hybrid candidate passed scoring, risk, net-profit, and live orderbook gates. This is not an order instruction."
-    if status == "DANGER_CHASING":
+    if status == WatchlistStatus.DANGER_CHASING:
         return "DANGER_CHASING because price extension is above configured safety thresholds."
-    if status == "DISTRIBUTION_WARNING":
+    if status == WatchlistStatus.DISTRIBUTION_WARNING:
         return "DISTRIBUTION_WARNING because broker-flow distribution risk is too strong for a clean watchlist candidate."
-    if status == "ORDERBOOK_REJECT":
+    if status == WatchlistStatus.ORDERBOOK_REJECT:
         return "ORDERBOOK_REJECT because spread, offer wall, tradability, or other orderbook safety gates failed."
-    if status == "ORDERBOOK_WEAK":
+    if status == WatchlistStatus.ORDERBOOK_WEAK:
         return "ORDERBOOK_WEAK because live depth, spread, or frequency is not supportive enough for micro execution."
-    if status == "NET_PROFIT_NOT_WORTH_IT":
+    if status == WatchlistStatus.NET_PROFIT_NOT_WORTH_IT:
         return "NET_PROFIT_NOT_WORTH_IT because expected TP is too small after estimated fees and slippage."
-    if status == "RISK_REWARD_BAD":
+    if status == WatchlistStatus.RISK_REWARD_BAD:
         return "RISK_REWARD_BAD because the configured stop and target do not meet minimum R:R."
-    if status == "TOO_EXPENSIVE_FOR_CAPITAL":
+    if status == WatchlistStatus.TOO_EXPENSIVE_FOR_CAPITAL:
         return "TOO_EXPENSIVE_FOR_CAPITAL because one lot or the stock price exceeds the selected capital profile."
-    if status == "LOW_LIQUIDITY":
+    if status == WatchlistStatus.LOW_LIQUIDITY:
         return "LOW_LIQUIDITY because average value or frequency is below configured execution thresholds."
-    if status == "DATA_INSUFFICIENT":
+    if status == WatchlistStatus.DATA_INSUFFICIENT:
         return "DATA_INSUFFICIENT because required symbol or price data is missing."
+    if status == WatchlistStatus.COMMODITY_HEADWIND:
+        return "COMMODITY_HEADWIND because the underlying global commodity price is down heavily, indicating negative sector sentiment."
     reason_text = ", ".join(skip_reasons[:3]) if skip_reasons else "scores did not meet the watchlist gates"
     warning_text = f" Warnings: {', '.join(warnings[:4])}." if warnings else ""
     return f"SKIP because {reason_text}.{warning_text}"
@@ -1075,7 +1105,6 @@ def run_hybrid_screener(
         config = replace(
             config,
             market_regime=replace(config.market_regime, enabled=enable_market_regime),
-            safety=replace(config.safety, hard_market_regime_risk_off=enable_market_regime)
         )
     if enable_multibar_confirm is not None:
         config = replace(
