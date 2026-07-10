@@ -439,7 +439,10 @@ def test_strategy_mode_defaults_remain_interday() -> None:
     assert config.strategy_mode == "interday"
     assert config.tp1_pct == 0.05
     assert config.tp2_pct == 0.08
-    assert config.max_stop_loss_pct == 0.08
+    assert config.max_stop_loss_pct == 0.10
+    assert config.min_rr_tp1 == 1.0
+    assert config.min_rr_tp2 == 1.5
+    assert config.bandarmology_min_score == 50
     assert config.time_stop_days == 10
     assert config.require_orderbook_confirmation is False
     assert config.force_exit_same_day is False

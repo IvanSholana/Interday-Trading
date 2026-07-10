@@ -132,6 +132,29 @@ def test_risk_plan_positive_net_profit_after_fee():
     assert risk.net_profit_feasibility_score == 100
 
 
+def test_risk_plan_reuses_stage4_prices():
+    risk = build_risk_plan(
+        normalize_candidate_row(
+            candidate(
+                entry_price=1000,
+                take_profit_1=1060,
+                take_profit_2=1090,
+                stop_loss=970,
+            )
+        ),
+        HybridScreenerConfig(),
+        "capital_1m",
+        "normal_execution",
+    )
+
+    assert risk.entry_price == 1000
+    assert risk.tp1_price == 1060
+    assert risk.tp2_price == 1090
+    assert risk.stop_loss_price == 970
+    assert risk.target_tp_pct == 0.06
+    assert risk.stop_loss_pct == 0.03
+
+
 def test_risk_plan_negative_due_to_fee_slippage_and_tick_rounding():
     risk = build_risk_plan(
         normalize_candidate_row(candidate(target_tp_pct=0.004)),
@@ -170,6 +193,25 @@ def test_runtime_multibar_override_does_not_mutate_multibar_config_shape(tmp_pat
 
     assert not result.empty
     assert output_path.exists()
+
+
+def test_runtime_capital_risk_and_position_overrides_are_applied(tmp_path):
+    input_path = tmp_path / "stage4.csv"
+    output_path = tmp_path / "hybrid.csv"
+    pd.DataFrame([candidate(entry_price=1000, take_profit_1=1050, stop_loss=980)]).to_csv(input_path, index=False)
+
+    result = run_hybrid_screener(
+        input_path,
+        output_path,
+        mode="normal_execution",
+        capital_profile="capital_1m",
+        capital=500_000,
+        risk_per_trade_pct=0.01,
+        max_position_pct=0.20,
+    )
+
+    assert result.iloc[0]["position_value"] <= 100_000
+    assert result.iloc[0]["risk_budget_amount"] == 5_000
 
 
 def test_missing_broker_flow_and_sector_data_do_not_crash():

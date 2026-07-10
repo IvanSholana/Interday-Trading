@@ -277,11 +277,11 @@ class WatchlistConfig:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    minimum_net_profit: float = 5_000
-    minimum_risk_reward: float = 1.2
+    minimum_net_profit: float = 3_000
+    minimum_risk_reward: float = 1.0
     lot_size: int = DEFAULT_BPJS_PROFILE.lot_size
-    risk_per_trade_pct: float = DEFAULT_BPJS_PROFILE.risk_per_trade_pct
-    max_risk_per_trade_pct: float = DEFAULT_BPJS_PROFILE.max_risk_per_trade_pct
+    risk_per_trade_pct: float = 0.01
+    max_risk_per_trade_pct: float = 0.01
     hard_max_loss_pct: float = DEFAULT_BPJS_PROFILE.hard_max_loss_pct
 
 

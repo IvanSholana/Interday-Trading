@@ -135,7 +135,7 @@ export const RecommendationPanel: React.FC<RecommendationPanelProps> = ({ pack, 
           <div>
             <h2 style={{ fontSize: '1.15rem', color: 'white' }}>Professional Recommendation Pack</h2>
             <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: 4 }}>
-              Capital {formatIdr(pack.capital)} | TP cap {formatPct(pack.max_tp_pct)} | Max position {formatPct(pack.max_position_pct)}
+              Capital {formatIdr(pack.capital)} | Target net portofolio {formatPct(pack.portfolio_target_profit_pct)} | Max position {formatPct(pack.max_position_pct)}
             </div>
             <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: 4 }}>
               Schema {pack.schema_version} | Policy {pack.policy_version}
@@ -168,9 +168,12 @@ export const RecommendationPanel: React.FC<RecommendationPanelProps> = ({ pack, 
       )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 18 }}>
+        {primaryMetric('Target Net', formatIdr(pack.portfolio_target_profit_amount))}
         {primaryMetric('Selected Exposure', formatIdr(pack.total_selected_position_value))}
         {primaryMetric('Capital Usage', formatPct(pack.total_selected_capital_usage_pct))}
         {primaryMetric('Selected Net', formatIdr(pack.total_selected_expected_net_profit))}
+        {primaryMetric('Target Progress', formatPct(pack.portfolio_target_progress_pct))}
+        {primaryMetric('Shortfall', formatIdr(pack.portfolio_profit_shortfall_amount))}
         {primaryMetric('Selected Max Loss', formatIdr(pack.total_selected_max_loss_amount))}
         {primaryMetric('Max Loss %', formatPct(pack.total_selected_max_loss_pct))}
       </div>

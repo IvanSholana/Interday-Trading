@@ -180,7 +180,7 @@ MCP_CAPABILITIES = [
         name="get_trade_recommendation",
         category="decision_support",
         mutation_level="read_only",
-        when_to_use="Use after hybrid watchlist exists to get capital-aware sizing, TP cap, net-profit, and portfolio guardrails.",
+        when_to_use="Use after hybrid watchlist exists to get capital-aware sizing, portfolio profit target progress, net profit, and risk guardrails.",
         output_formats=["markdown", "json"],
         safety_note="Returns REVIEW_BUY/WAIT_CONFIRMATION/WATCH_ONLY/AVOID semantics; user must still confirm live market conditions.",
     ),
@@ -944,7 +944,8 @@ def get_trade_recommendation(
     Args:
         run_id: Pipeline run ID that contains ``hybrid_watchlist.csv``.
         capital: Available capital in IDR used for position sizing context.
-        max_tp_pct: Maximum acceptable TP percentage, e.g. ``0.05`` for 5%.
+        max_tp_pct: Portfolio net-profit target, e.g. ``0.05`` for 5% of
+            capital. The legacy name is retained for compatibility.
         max_position_pct: Maximum capital allocation for a single candidate.
         limit: Maximum shortlist rows to render.
         output_format: ``markdown`` for humans or ``json`` for structured agent use.
@@ -982,6 +983,12 @@ def _execution_summary_payload(pack) -> dict[str, object]:
         "policy_version": pack.policy_version,
         "portfolio_decision": pack.portfolio_decision,
         "portfolio_flags": pack.portfolio_flags,
+        "portfolio_target_profit_pct": pack.portfolio_target_profit_pct,
+        "portfolio_target_profit_amount": pack.portfolio_target_profit_amount,
+        "portfolio_expected_net_return_pct": pack.portfolio_expected_net_return_pct,
+        "portfolio_target_progress_pct": pack.portfolio_target_progress_pct,
+        "portfolio_profit_shortfall_amount": pack.portfolio_profit_shortfall_amount,
+        "portfolio_target_reached": pack.portfolio_target_reached,
         "data_quality": pack.data_quality,
         "selected_count": pack.selected_count,
         "total_selected_position_value": pack.total_selected_position_value,
@@ -1092,7 +1099,8 @@ def get_run_audit(
     Args:
         run_id: Pipeline run ID to audit.
         capital: Capital used to derive the embedded recommendation pack.
-        max_tp_pct: Maximum TP percentage accepted by the user's plan.
+        max_tp_pct: Portfolio net-profit target as a fraction of capital. The
+            legacy name is retained for compatibility.
         max_position_pct: Maximum capital allocation for a single candidate.
         output_format: ``markdown`` for humans or ``json`` for structured agent use.
     """

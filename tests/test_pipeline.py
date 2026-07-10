@@ -7,6 +7,7 @@ from interday_liquidity_screener.pipeline import (
     apply_runtime_api_keys,
     build_run_paths,
     create_run_id,
+    is_morning_live_refresh,
     load_csv,
     parse_ticker_text,
     PipelineOptions,
@@ -14,6 +15,18 @@ from interday_liquidity_screener.pipeline import (
     run_pipeline,
     token_available,
 )
+
+
+def test_morning_resume_refresh_detection_is_shared_by_pipeline_clients() -> None:
+    assert is_morning_live_refresh(
+        ["stage3c", "stage4", "hybrid", "stage5", "stage6"],
+        resume=True,
+    )
+    assert not is_morning_live_refresh(
+        ["stage1", "stage2", "stage3a", "stage3b", "stage3c"],
+        resume=True,
+    )
+    assert not is_morning_live_refresh(["stage3c", "hybrid"], resume=False)
 
 
 def test_create_run_id_uses_expected_timestamp_format() -> None:

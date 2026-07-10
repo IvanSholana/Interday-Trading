@@ -1,0 +1,15 @@
+INFO:     127.0.0.1:57387 - "POST /api/run HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55766 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55769 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55778 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55785 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55789 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55796 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55802 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55809 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55813 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55818 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55822 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63616 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53024 - "GET /api/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52801 - "GET /api/run-audit/20260710_155711?capital=1000000&max_tp_pct=0.05&max_position_pct=1.0 HTTP/1.1" 200 OK

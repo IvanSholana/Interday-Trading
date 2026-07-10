@@ -172,6 +172,13 @@ export interface RecommendationPack {
   policy_version: string;
   policy: Record<string, number | string>;
   capital: number;
+  portfolio_target_profit_pct: number;
+  portfolio_target_profit_amount: number;
+  portfolio_expected_net_return_pct: number | null;
+  portfolio_target_progress_pct: number;
+  portfolio_profit_shortfall_amount: number;
+  portfolio_target_reached: boolean;
+  /** Backward-compatible alias; since schema v2 this is the portfolio profit target. */
   max_tp_pct: number;
   max_position_pct: number;
   portfolio_decision: string;

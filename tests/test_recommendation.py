@@ -44,9 +44,9 @@ def test_recommendation_prefers_high_score_execution_draft_with_lot_sizing() -> 
 
     pack = build_recommendation_pack(watchlist, run_id="20260708_205047", capital=1_000_000, max_tp_pct=0.05)
 
-    assert pack.schema_version == "recommendation-pack-v1"
+    assert pack.schema_version == "recommendation-pack-v2"
     assert pack.policy_version == "2026-07-professional-mvp-v1"
-    assert pack.policy["min_risk_reward"] == 1.2
+    assert pack.policy["min_risk_reward"] == 1.0
     assert pack.primary is not None
     assert pack.primary.symbol == "PGEO"
     assert pack.primary.readiness == "NEEDS_LIVE_CONFIRMATION"
@@ -65,16 +65,20 @@ def test_recommendation_prefers_high_score_execution_draft_with_lot_sizing() -> 
     assert pack.data_quality["total_rows"] == 2
     assert pack.data_quality["complete_price_plan_count"] == 2
     assert pack.data_quality["missing_price_plan_count"] == 0
-    assert pack.total_selected_position_value == 1_918_000
-    assert pack.total_selected_capital_usage_pct == 1.918
-    assert pack.total_selected_expected_net_profit == 21_376.5
-    assert pack.total_selected_max_loss_amount == 20_000
-    assert pack.total_selected_max_loss_pct == 0.02
-    assert pack.portfolio_decision == "PICK_PRIMARY_ONLY_OR_REDUCE_SIZE"
-    assert "SHORTLIST_OVER_ALLOCATED" in pack.portfolio_flags
+    assert pack.total_selected_position_value == 940_000
+    assert pack.total_selected_capital_usage_pct == 0.94
+    assert pack.total_selected_expected_net_profit == 9_307.5
+    assert pack.portfolio_target_profit_amount == 50_000
+    assert pack.portfolio_target_progress_pct == 9_307.5 / 50_000
+    assert pack.portfolio_profit_shortfall_amount == 40_692.5
+    assert pack.portfolio_target_reached is False
+    assert pack.total_selected_max_loss_amount == 10_000
+    assert pack.total_selected_max_loss_pct == 0.01
+    assert pack.portfolio_decision == "WITHIN_BUDGET_REVIEW"
+    assert "PROFIT_TARGET_NOT_REACHED" in pack.portfolio_flags
 
 
-def test_recommendation_excludes_candidates_above_tp_cap() -> None:
+def test_recommendation_does_not_treat_portfolio_target_as_candidate_tp_cap() -> None:
     watchlist = pd.DataFrame(
         [
             {
@@ -101,11 +105,11 @@ def test_recommendation_excludes_candidates_above_tp_cap() -> None:
     pack = build_recommendation_pack(watchlist, run_id="run", capital=1_000_000, max_tp_pct=0.05)
 
     assert pack.primary is not None
-    assert pack.primary.symbol == "SLOW"
-    assert pack.excluded_by_tp_limit_count == 1
+    assert pack.primary.symbol == "FAST"
+    assert pack.excluded_by_tp_limit_count == 0
     assert pack.ready_count == 1
     assert pack.watch_count == 1
-    assert all(item.symbol != "FAST" for item in pack.candidates)
+    assert [item.symbol for item in pack.candidates] == ["FAST"]
 
 
 def test_recommendation_caps_position_value_to_max_position_pct() -> None:
@@ -149,7 +153,35 @@ def test_recommendation_caps_position_value_to_max_position_pct() -> None:
     assert pack.total_selected_max_loss_amount == 2_000
     assert pack.total_selected_max_loss_pct == 0.002
     assert pack.portfolio_decision == "WITHIN_BUDGET_REVIEW"
-    assert pack.portfolio_flags == []
+    assert pack.portfolio_flags == ["PROFIT_TARGET_NOT_REACHED"]
+
+
+def test_recommendation_rejects_one_lot_above_position_cap() -> None:
+    watchlist = pd.DataFrame(
+        [
+            {
+                "symbol": "ASII",
+                "final_status": WatchlistStatus.EXECUTION_READY.value,
+                "final_score": 92,
+                "entry_price": 4_790,
+                "tp1_price": 4_880,
+                "stop_loss_price": 4_740,
+                "position_value": 958_000,
+                "position_size_lots": 2,
+            }
+        ]
+    )
+
+    pack = build_recommendation_pack(
+        watchlist,
+        run_id="run",
+        capital=1_000_000,
+        max_position_pct=0.20,
+    )
+
+    assert pack.primary is None
+    assert pack.selected_count == 0
+    assert pack.data_quality["affordable_lot_count"] == 0
 
 
 def test_recommendation_reads_stage4_style_column_aliases() -> None:
@@ -228,7 +260,7 @@ def test_render_recommendation_markdown_includes_primary_and_caveat() -> None:
     markdown = render_recommendation_markdown(pack)
 
     assert "# Professional Trade Recommendation Pack: run" in markdown
-    assert "recommendation-pack-v1" in markdown
+    assert "recommendation-pack-v2" in markdown
     assert "Policy" in markdown
     assert "**BBCA**" in markdown
     assert "REVIEW_BUY" in markdown
@@ -245,3 +277,35 @@ def test_empty_recommendation_pack_has_no_portfolio_action() -> None:
     assert pack.portfolio_decision == "NO_PORTFOLIO_ACTION"
     assert pack.portfolio_flags == ["NO_SELECTED_CANDIDATES"]
     assert pack.data_quality["total_rows"] == 0
+
+
+def test_recommendation_accumulates_multiple_positions_until_portfolio_target() -> None:
+    watchlist = pd.DataFrame(
+        [
+            {
+                "symbol": symbol,
+                "final_status": WatchlistStatus.EXECUTION_READY.value,
+                "final_score": score,
+                "entry_price": 100,
+                "tp1_price": 125,
+                "stop_loss_price": 95,
+                "position_value": 200_000,
+            }
+            for symbol, score in [("AAA", 90), ("BBB", 80), ("CCC", 70), ("DDD", 60)]
+        ]
+    )
+
+    pack = build_recommendation_pack(
+        watchlist,
+        run_id="run",
+        capital=1_000_000,
+        max_tp_pct=0.05,
+        max_position_pct=0.20,
+    )
+
+    assert pack.portfolio_target_profit_amount == 50_000
+    assert [item.symbol for item in pack.candidates] == ["AAA", "BBB"]
+    assert pack.total_selected_expected_net_profit is not None
+    assert pack.total_selected_expected_net_profit >= 50_000
+    assert pack.portfolio_target_reached is True
+    assert pack.portfolio_profit_shortfall_amount == 0

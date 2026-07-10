@@ -47,9 +47,9 @@ STATUS_PRIORITY = {
 @dataclass(frozen=True)
 class RecommendationPolicy:
     version: str = "2026-07-professional-mvp-v1"
-    min_risk_reward: float = 1.2
-    min_expected_gross_profit_idr: float = 5_000.0
-    min_expected_net_profit_idr: float = 5_000.0
+    min_risk_reward: float = 1.0
+    min_expected_gross_profit_idr: float = 3_000.0
+    min_expected_net_profit_idr: float = 3_000.0
     max_portfolio_loss_pct: float = 0.02
     execution_ready_a_confidence: float = 80.0
     positive_b_confidence: float = 65.0
@@ -67,7 +67,7 @@ class RecommendationPolicy:
 
 
 DEFAULT_RECOMMENDATION_POLICY = RecommendationPolicy()
-RECOMMENDATION_SCHEMA_VERSION = "recommendation-pack-v1"
+RECOMMENDATION_SCHEMA_VERSION = "recommendation-pack-v2"
 
 
 class Readiness:
@@ -109,12 +109,12 @@ class PortfolioFlag:
     NO_SELECTED_CANDIDATES = "NO_SELECTED_CANDIDATES"
     SHORTLIST_OVER_ALLOCATED = "SHORTLIST_OVER_ALLOCATED"
     PORTFOLIO_MAX_LOSS_ABOVE_2PCT = "PORTFOLIO_MAX_LOSS_ABOVE_2PCT"
+    PROFIT_TARGET_NOT_REACHED = "PROFIT_TARGET_NOT_REACHED"
 
 
 HARD_AUDIT_FLAGS = {
     AuditFlag.INCOMPLETE_PRICE_PLAN,
     AuditFlag.NO_AFFORDABLE_LOT,
-    AuditFlag.TP_OUTSIDE_USER_CAP,
     AuditFlag.LOW_NET_PROFIT_AFTER_COSTS,
 }
 
@@ -173,6 +173,14 @@ class RecommendationPack:
     policy_version: str
     policy: dict[str, float | str]
     capital: float
+    portfolio_target_profit_pct: float
+    portfolio_target_profit_amount: float
+    portfolio_expected_net_return_pct: float | None
+    portfolio_target_progress_pct: float
+    portfolio_profit_shortfall_amount: float
+    portfolio_target_reached: bool
+    # Backward-compatible API alias. Since schema v2 this is a portfolio
+    # profit target, not a per-candidate TP ceiling.
     max_tp_pct: float
     max_position_pct: float
     portfolio_decision: str
@@ -305,8 +313,6 @@ def _audit_flags(
         flags.append(AuditFlag.WATCH_ONLY)
     if entry is None or tp1 is None or stop is None:
         flags.append(AuditFlag.INCOMPLETE_PRICE_PLAN)
-    if tp_pct is not None and (tp_pct <= 0 or tp_pct > max_tp_pct):
-        flags.append(AuditFlag.TP_OUTSIDE_USER_CAP)
     if rr is not None and rr < DEFAULT_RECOMMENDATION_POLICY.min_risk_reward:
         flags.append(AuditFlag.RISK_REWARD_BELOW_MINIMUM)
     if lots < 1:
@@ -336,7 +342,7 @@ def _confidence_components(status: WatchlistStatus | None, final_score: float, r
     rr_component = max(0.0, min(rr or 0.0, policy.max_rr_component_input)) * policy.rr_component_weight
     penalty = 0.0
     for flag in flags:
-        if flag in {AuditFlag.INCOMPLETE_PRICE_PLAN, AuditFlag.NO_AFFORDABLE_LOT, AuditFlag.TP_OUTSIDE_USER_CAP}:
+        if flag in {AuditFlag.INCOMPLETE_PRICE_PLAN, AuditFlag.NO_AFFORDABLE_LOT}:
             penalty += policy.hard_flag_penalty
         elif flag.startswith("STATUS_"):
             penalty += policy.rejection_status_penalty
@@ -384,8 +390,7 @@ def _primary_reason(row: pd.Series, status: WatchlistStatus | None, tp_pct: floa
     if explanation:
         return explanation
     if status in POSITIVE_STATUSES:
-        tp_note = f" TP target is within the {max_tp_pct:.1%} cap." if tp_pct is not None and tp_pct <= max_tp_pct else ""
-        return f"{status.value} with acceptable ranking and a complete draft risk plan.{tp_note}"
+        return f"{status.value} with acceptable ranking and a complete draft risk plan. Its TP remains candidate-specific."
     if status in WATCH_STATUSES:
         return f"{status.value}; setup is improving but is not an execution signal yet."
     if status in REJECTION_STATUSES:
@@ -474,7 +479,9 @@ def _build_candidate(row: pd.Series, capital: float, max_tp_pct: float, max_posi
     source_position_value = _num_any(row, "position_value") or 0.0
     position_value, position_capped = _position_value_for_cap(source_position_value, entry, capital, max_position_pct)
     derived_lots = int(position_value // (entry * 100)) if entry and entry > 0 else 0
-    lots = derived_lots or int(_num_any(row, "lots") or 0)
+    # Never fall back to the source lot count after applying the user's
+    # position cap. A zero capped value means even one lot is unaffordable.
+    lots = derived_lots
     tp_pct = (tp1 - entry) / entry if entry and tp1 else _num_any(row, "target_tp_pct")
     sl_pct = (entry - stop) / entry if entry and stop else _num_any(row, "stop_loss_pct")
     rr = _num_any(row, "risk_reward_ratio")
@@ -561,6 +568,7 @@ def build_recommendation_pack(
     max_position_pct: float = 1.0,
     limit: int = 5,
 ) -> RecommendationPack:
+    target_profit_amount = capital * max_tp_pct
     if watchlist.empty:
         return RecommendationPack(
             run_id=run_id,
@@ -568,6 +576,12 @@ def build_recommendation_pack(
             policy_version=DEFAULT_RECOMMENDATION_POLICY.version,
             policy=DEFAULT_RECOMMENDATION_POLICY.to_dict(),
             capital=capital,
+            portfolio_target_profit_pct=max_tp_pct,
+            portfolio_target_profit_amount=target_profit_amount,
+            portfolio_expected_net_return_pct=None,
+            portfolio_target_progress_pct=0.0,
+            portfolio_profit_shortfall_amount=target_profit_amount,
+            portfolio_target_reached=False,
             max_tp_pct=max_tp_pct,
             max_position_pct=max_position_pct,
             portfolio_decision=PortfolioDecision.NO_PORTFOLIO_ACTION,
@@ -599,18 +613,24 @@ def build_recommendation_pack(
     draft_count = sum(1 for item in rows if item.readiness == Readiness.NEEDS_LIVE_CONFIRMATION)
     watch_count = sum(1 for item in rows if item.readiness == Readiness.WATCH_ONLY)
     rejected_count = sum(1 for item in rows if item.readiness == Readiness.REJECTED_OR_LOW_PRIORITY)
-    tp_eligible = [
+    eligible = [
         item
         for item in rows
-        if item.target_tp_pct is None or (0 < item.target_tp_pct <= max_tp_pct)
-    ]
-    excluded_by_tp_limit = len(rows) - len(tp_eligible)
-    actionable = [
-        item
-        for item in tp_eligible
         if _status(item.final_status) in POSITIVE_STATUSES | WATCH_STATUSES and item.lots > 0
     ]
-    actionable = sorted(actionable, key=_sort_key)[: max(limit, 0)]
+    selected: list[CandidateRecommendation] = []
+    selected_position = 0.0
+    selected_net_profit = 0.0
+    for item in sorted(eligible, key=_sort_key):
+        if len(selected) >= max(limit, 0) or selected_net_profit >= target_profit_amount:
+            break
+        if selected_position + item.position_value > capital:
+            continue
+        selected.append(item)
+        selected_position += item.position_value
+        selected_net_profit += item.expected_net_profit or 0.0
+
+    actionable = selected
     primary = actionable[0] if actionable else None
     total_position = sum(item.position_value for item in actionable)
     total_gross_profit = sum(item.expected_gross_profit or 0.0 for item in actionable) if actionable else None
@@ -619,10 +639,20 @@ def build_recommendation_pack(
     total_usage = total_position / capital if capital > 0 else 0.0
     total_loss_pct = total_max_loss / capital if total_max_loss is not None and capital > 0 else None
     portfolio_flags = _portfolio_flags(total_usage, total_loss_pct, len(actionable))
+    target_reached = total_net_profit is not None and total_net_profit >= target_profit_amount
+    if actionable and not target_reached:
+        portfolio_flags.append(PortfolioFlag.PROFIT_TARGET_NOT_REACHED)
     portfolio_decision = _portfolio_decision(portfolio_flags)
+    expected_net_return_pct = total_net_profit / capital if total_net_profit is not None and capital > 0 else None
+    target_progress_pct = (
+        max(0.0, total_net_profit or 0.0) / target_profit_amount
+        if target_profit_amount > 0
+        else 0.0
+    )
+    profit_shortfall = max(0.0, target_profit_amount - (total_net_profit or 0.0))
 
     if primary is None:
-        next_action = "No capital-sized candidate passed the TP cap and status filters; wait for a new scan."
+        next_action = "No capital-sized candidate passed the status and available-capital filters; wait for a new scan."
     elif primary.readiness == Readiness.READY:
         next_action = "Review the primary candidate at market open; keep the entry zone, TP, SL, and orderbook gates intact."
     elif primary.readiness == Readiness.NEEDS_LIVE_CONFIRMATION:
@@ -636,6 +666,12 @@ def build_recommendation_pack(
         policy_version=DEFAULT_RECOMMENDATION_POLICY.version,
         policy=DEFAULT_RECOMMENDATION_POLICY.to_dict(),
         capital=capital,
+        portfolio_target_profit_pct=max_tp_pct,
+        portfolio_target_profit_amount=target_profit_amount,
+        portfolio_expected_net_return_pct=expected_net_return_pct,
+        portfolio_target_progress_pct=target_progress_pct,
+        portfolio_profit_shortfall_amount=profit_shortfall,
+        portfolio_target_reached=target_reached,
         max_tp_pct=max_tp_pct,
         max_position_pct=max_position_pct,
         portfolio_decision=portfolio_decision,
@@ -651,7 +687,7 @@ def build_recommendation_pack(
         draft_count=draft_count,
         watch_count=watch_count,
         rejected_count=rejected_count,
-        excluded_by_tp_limit_count=excluded_by_tp_limit,
+        excluded_by_tp_limit_count=0,
         data_quality=_data_quality_summary(rows, len(actionable)),
         primary=primary,
         candidates=actionable,
@@ -686,14 +722,14 @@ def render_recommendation_markdown(pack: RecommendationPack) -> str:
         f"- **Schema**: {pack.schema_version}",
         f"- **Capital**: {_idr(pack.capital)}",
         f"- **Policy**: {pack.policy_version}",
-        f"- **TP cap**: {_pct(pack.max_tp_pct)}",
+        f"- **Portfolio net profit target**: {_idr(pack.portfolio_target_profit_amount)} ({_pct(pack.portfolio_target_profit_pct)} of capital)",
+        f"- **Target progress / shortfall**: {_pct(pack.portfolio_target_progress_pct)} / {_idr(pack.portfolio_profit_shortfall_amount)}",
         f"- **Max position**: {_pct(pack.max_position_pct)}",
         f"- **Portfolio decision**: {pack.portfolio_decision}",
         f"- **Portfolio flags**: {', '.join(pack.portfolio_flags) if pack.portfolio_flags else 'CLEAR'}",
         f"- **Selected exposure**: {_idr(pack.total_selected_position_value)} ({_pct(pack.total_selected_capital_usage_pct)} of capital)",
         f"- **Selected expected gross / net / max loss**: {_idr(pack.total_selected_expected_gross_profit)} / {_idr(pack.total_selected_expected_net_profit)} / {_idr(pack.total_selected_max_loss_amount)}",
         f"- **Ready / Draft / Watch / Rejected**: {pack.ready_count} / {pack.draft_count} / {pack.watch_count} / {pack.rejected_count}",
-        f"- **Excluded by TP cap**: {pack.excluded_by_tp_limit_count}",
         f"- **Data quality**: {pack.data_quality['complete_price_plan_count']} complete price plans / {pack.data_quality['total_rows']} rows",
         "",
     ]

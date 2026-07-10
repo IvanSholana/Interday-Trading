@@ -7,6 +7,18 @@ from interday_liquidity_screener.constants import WatchlistStatus
 from interday_liquidity_screener import server
 
 
+def test_morning_phase_resume_refreshes_live_stages() -> None:
+    assert server.is_morning_live_refresh(
+        ["stage3c", "stage4", "hybrid", "stage5", "stage6"],
+        resume=True,
+    )
+    assert not server.is_morning_live_refresh(
+        ["stage1", "stage2", "stage3a", "stage3b", "stage3c"],
+        resume=True,
+    )
+    assert not server.is_morning_live_refresh(["stage3c", "hybrid"], resume=False)
+
+
 def test_recommendation_endpoint_returns_structured_pack(tmp_path, monkeypatch) -> None:
     run_root = tmp_path / "runs"
     run_dir = run_root / "20260708_205047"
@@ -33,7 +45,8 @@ def test_recommendation_endpoint_returns_structured_pack(tmp_path, monkeypatch) 
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["schema_version"] == "recommendation-pack-v1"
+    assert payload["schema_version"] == "recommendation-pack-v2"
+    assert payload["portfolio_target_profit_amount"] == 50_000
     assert payload["primary"]["symbol"] == "PGEO"
     assert payload["primary"]["decision_grade"] == "B"
     assert payload["primary"]["readiness"] == "NEEDS_LIVE_CONFIRMATION"

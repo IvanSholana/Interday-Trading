@@ -31,6 +31,7 @@ try:
         build_run_paths,
         create_run_id,
         discover_run_dirs,
+        is_morning_live_refresh,
         resolve_artifact_path,
         summarize_run,
         token_available,
@@ -53,6 +54,7 @@ except ImportError:
         build_run_paths,
         create_run_id,
         discover_run_dirs,
+        is_morning_live_refresh,
         resolve_artifact_path,
         summarize_run,
         token_available,
@@ -109,6 +111,7 @@ def append_state_log(msg: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
         pipeline_state.logs.append(f"[{timestamp}] {msg}")
 
+
 # Background worker for pipeline
 def run_pipeline_thread(
     options: PipelineOptions,
@@ -130,6 +133,12 @@ def run_pipeline_thread(
     append_state_log(f"Starting pipeline run. Run ID: {run_paths.run_id}{' (Resuming from failure)' if resume else ''}")
     append_state_log(f"Target Date: {options.run_date}, Strategy: {options.strategy_mode}")
     append_state_log(f"Selected Stages: {', '.join(stages)}")
+    if is_morning_live_refresh(stages, resume):
+        # Stage 3C and every selected downstream artifact must be regenerated;
+        # otherwise resume caching reuses last night's orderbook CSV and the
+        # morning button performs no live confirmation at all.
+        resume = False
+        append_state_log("Fase Pagi: refreshing live orderbook and selected downstream stages.")
     
     original_stdout = sys.stdout
     capturer = LiveLogCapture(original_stdout, append_state_log)
@@ -240,7 +249,14 @@ def run_pipeline_thread(
                     capture_stage(
                         "Stage 3C - Orderbook",
                         paths.stage3c,
-                        lambda: run_stage3c_orderbook_filter(paths.stage2, paths.stage3b, paths.stage3c, paths.raw_orderbook, config),
+                        lambda: run_stage3c_orderbook_filter(
+                            paths.stage2,
+                            paths.stage3b,
+                            paths.stage3c,
+                            paths.raw_orderbook,
+                            config,
+                            watchlist_path=paths.hybrid_watchlist,
+                        ),
                         resume=resume,
                     )
                 )
@@ -271,13 +287,13 @@ def run_pipeline_thread(
                         "Stage Hybrid - Dual Flow Watchlist",
                         paths.hybrid_watchlist,
                         lambda: run_hybrid_screener(
-                            input_path=paths.stage2,
+                            input_path=paths.stage4 if paths.stage4.exists() else paths.stage2,
                             output_path=paths.hybrid_watchlist,
                             mode=options.hybrid_mode,
                             capital_profile=options.hybrid_capital_profile,
                             config_path=options.hybrid_config_path,
-                            broker_flow_path=broker_path,
-                            orderbook_path=orderbook_path,
+                            broker_flow_path=None if paths.stage4.exists() else broker_path,
+                            orderbook_path=None if paths.stage4.exists() else orderbook_path,
                             date=options.run_date,
                             max_candidates=options.hybrid_max_candidates,
                             enable_market_regime=options.enable_market_regime,
@@ -285,6 +301,9 @@ def run_pipeline_thread(
                             enable_adaptive_tp=options.enable_adaptive_tp,
                             enable_liquidity_sizer=options.enable_liquidity_sizer,
                             enable_blackout=options.enable_blackout,
+                            capital=options.capital,
+                            risk_per_trade_pct=options.risk_per_trade_pct,
+                            max_position_pct=options.max_position_pct,
                         ),
                         resume=resume,
                     )
@@ -787,7 +806,8 @@ def get_run_recommendation(
     Args:
         run_id: Run directory name (e.g. ``"20260708_091500"``).
         capital: Available capital in IDR for sizing context.
-        max_tp_pct: Maximum TP percentage allowed by the user's plan.
+        max_tp_pct: Portfolio net-profit target as a fraction of capital. The
+            legacy parameter name is retained for API compatibility.
         max_position_pct: Maximum capital allocation for a single candidate.
         limit: Maximum shortlist rows returned.
 
@@ -1145,9 +1165,11 @@ def trigger_run(payload: RunRequest, background_tasks: BackgroundTasks):
     """Start a new pipeline run or resume a previously failed one.
 
     If ``resume_run_id`` is provided in the payload, the backend reuses the
-    existing run directory and skips any stages whose output file already exists
-    (see ``capture_stage`` in ``pipeline.py``). Otherwise a fresh ``run_id``
-    is generated and a new directory is created.
+    existing run directory and normally skips stages whose output file already
+    exists (see ``capture_stage`` in ``pipeline.py``). A morning-only selection
+    starting at Stage 3C refreshes the live orderbook and selected downstream
+    artifacts instead of reusing the previous snapshot. Otherwise a fresh
+    ``run_id`` is generated and a new directory is created.
 
     The pipeline runs in a background daemon thread. Poll ``GET /api/status``
     at ~1s intervals to track progress.

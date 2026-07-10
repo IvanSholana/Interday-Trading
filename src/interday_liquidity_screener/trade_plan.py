@@ -24,6 +24,7 @@ ACTIVE_TECHNICAL_CONTEXTS = {
     "VOLUME_SPIKE",
     "EARLY_REVERSAL_ATTEMPT",
     "SIDEWAYS_COMPRESSION",
+    "TOO_QUIET_ABSOLUTE",
 }
 
 _FUNNEL_COUNTS: dict[str, int] = {}
@@ -401,13 +402,13 @@ class TradePlanConfig:
     tp1_pct: float | None = None
     tp2_pct: float | None = None
     max_stop_loss_pct: float | None = None
-    min_rr_tp1: float = 1.2
-    min_rr_tp2: float = 1.8
-    rebound_min_rr_tp1: float = 1.3
-    rebound_min_rr_tp2: float = 2.0
+    min_rr_tp1: float = 1.0
+    min_rr_tp2: float = 1.5
+    rebound_min_rr_tp1: float = 1.1
+    rebound_min_rr_tp2: float = 1.6
     time_stop_days: int | None = None
     lot_size: int = 100
-    bandarmology_min_score: int = 60
+    bandarmology_min_score: int = 50
     allow_trade_without_broker_data: bool = False
     require_orderbook_confirmation: bool | None = None
     strategy_mode: str = "interday"
@@ -427,7 +428,7 @@ class TradePlanConfig:
                 "max_position_pct": 0.20,
                 "tp1_pct": 0.05,
                 "tp2_pct": 0.08,
-                "max_stop_loss_pct": 0.08,
+                "max_stop_loss_pct": 0.10,
                 "time_stop_days": 10,
                 "require_orderbook_confirmation": False,
                 "force_exit_same_day": False,
@@ -1008,9 +1009,6 @@ def validate_pre_plan_gate(result: dict[str, Any], config: TradePlanConfig) -> s
         if technical_context == "TOO_VOLATILE":
             _inc_funnel("bandar_technical_context_too_volatile_fail")
             return "REJECT_TOO_VOLATILE"
-        if technical_context == "TOO_QUIET_ABSOLUTE":
-            _inc_funnel("bandar_technical_context_too_quiet_fail")
-            return "SKIPPED_NOT_TRADE_CANDIDATE"
 
         broker_available = _bool_value(result.get("broker_activity_available"))
         signal = result.get("bandarmology_signal")

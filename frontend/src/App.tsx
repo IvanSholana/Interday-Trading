@@ -15,20 +15,33 @@ import type { RunRequest, CapitalProfile } from './types/api';
 /** Active navigation tab options. */
 type ActiveTab = 'dashboard' | 'smart_money' | 'scheduler' | 'monitor' | 'results' | 'charts' | 'report';
 
+/** Return today's calendar date in the application's IDX/Jakarta timezone. */
+function getJakartaToday(): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Jakarta',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const value = (type: 'year' | 'month' | 'day'): string =>
+    parts.find((part) => part.type === type)?.value ?? '';
+  return `${value('year')}-${value('month')}-${value('day')}`;
+}
+
 export default function App() {
   // ── Sidebar / pipeline config state ──────────────────────────────────────
-  const [runDate, setRunDate] = useState<string>('2026-07-06');
+  const [runDate, setRunDate] = useState<string>(getJakartaToday);
   const [strategyMode, setStrategyMode] = useState<'interday' | 'bpjs'>('interday');
   const [universeKey, setUniverseKey] = useState<string>('lq45');
   const [tickersText, setTickersText] = useState<string>('');
-  const [capital, setCapital] = useState<number>(10000000);
+  const [capital, setCapital] = useState<number>(1000000);
   const [selectedStages, setSelectedStages] = useState<string[]>([
     'stage1', 'stage2', 'stage3a', 'stage3b', 'stage3c', 'stage4', 'hybrid', 'stage5', 'stage6',
   ]);
   const [dryRunLlm, setDryRunLlm] = useState<boolean>(true);
   const [refreshMarketData, setRefreshMarketData] = useState<boolean>(false);
-  const [riskPerTradePct, setRiskPerTradePct] = useState<number>(0.5);
-  const [maxPositionPct, setMaxPositionPct] = useState<number>(20.0);
+  const [riskPerTradePct, setRiskPerTradePct] = useState<number>(1.0);
+  const [maxPositionPct, setMaxPositionPct] = useState<number>(100.0);
 
   // Peningkatan Edge (P1–P5) Toggles
   const [enableMarketRegime, setEnableMarketRegime] = useState<boolean>(false);
@@ -81,7 +94,7 @@ export default function App() {
       capital,
       risk_per_trade_pct: riskPerTradePct / 100,
       max_position_pct: maxPositionPct / 100,
-      bandarmology_min_score: 60,
+      bandarmology_min_score: 50,
       dry_run_llm: dryRunLlm,
       refresh_market_data: refreshMarketData,
       allow_trade_without_broker_data: false,

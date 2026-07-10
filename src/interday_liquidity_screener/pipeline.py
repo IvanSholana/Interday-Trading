@@ -34,7 +34,7 @@ try:
     from .ticker_universe import UNIVERSE_PRESETS, get_universe_preset, read_universe_text
     from .tickers import load_tickers, normalize_ticker
     from .trade_plan import TradePlanConfig, run_stage_4_trade_plan
-    from .constants import WatchlistStatus
+    from .constants import PipelineStage, WatchlistStatus
 except ImportError:
     package_root = Path(__file__).resolve().parents[1]
     if str(package_root) not in sys.path:
@@ -59,7 +59,7 @@ except ImportError:
     from interday_liquidity_screener.ticker_universe import UNIVERSE_PRESETS, get_universe_preset, read_universe_text
     from interday_liquidity_screener.tickers import load_tickers, normalize_ticker
     from interday_liquidity_screener.trade_plan import TradePlanConfig, run_stage_4_trade_plan
-    from interday_liquidity_screener.constants import WatchlistStatus
+    from interday_liquidity_screener.constants import PipelineStage, WatchlistStatus
 
 APP_TITLE = "Interday Trading Dashboard"
 DEFAULT_RUN_ROOT = Path("data/output/ui_runs")
@@ -220,7 +220,7 @@ class PipelineOptions:
     capital: float = 500_000
     risk_per_trade_pct: float | None = None
     max_position_pct: float | None = None
-    bandarmology_min_score: int = 60
+    bandarmology_min_score: int = 50
     stockbit_sleep_seconds: float = 3.0
     orderbook_sleep_seconds: float = 2.0
     dry_run_llm: bool = True
@@ -437,6 +437,25 @@ def capture_stage(name: str, output_path: Path | None, func: Callable[[], Any], 
         return StageRunResult(name=name, ok=False, log=buffer.getvalue(), output_path=output_path, error=str(exc))
 
 
+def is_morning_live_refresh(stage_names: list[str], resume: bool) -> bool:
+    """Return whether a resumed selection must refresh live morning artifacts."""
+    stage_set = {
+        stage.value if isinstance(stage, PipelineStage) else str(stage)
+        for stage in stage_names
+    }
+    preparation_stages = {
+        PipelineStage.STAGE1.value,
+        PipelineStage.STAGE2.value,
+        PipelineStage.STAGE3A.value,
+        PipelineStage.STAGE3B.value,
+    }
+    return (
+        resume
+        and PipelineStage.STAGE3C.value in stage_set
+        and preparation_stages.isdisjoint(stage_set)
+    )
+
+
 def run_stage1_screening(tickers_file: str | Path, output_path: str | Path, options: PipelineOptions) -> pd.DataFrame:
     config = ScreenerConfig(
         period=options.period_stage1,
@@ -461,7 +480,12 @@ def run_pipeline(
     paths: PipelinePaths | None = None,
     resume: bool = False,
 ) -> tuple[PipelinePaths, list[StageRunResult]]:
-    stage_set = set(stage_names or ["stage1", "stage2", "stage3a", "stage3b", "stage3c", "stage4", "hybrid", "stage5", "stage6"])
+    selected_stages = stage_names or ["stage1", "stage2", "stage3a", "stage3b", "stage3c", "stage4", "hybrid", "stage5", "stage6"]
+    stage_set = set(selected_stages)
+    if is_morning_live_refresh(selected_stages, resume):
+        # Refresh Stage 3C and every selected downstream artifact. This keeps
+        # CLI and MCP morning runs consistent with the dashboard behavior.
+        resume = False
     paths = paths or build_run_paths(options.run_root)
     paths.run_dir.mkdir(parents=True, exist_ok=True)
     results: list[StageRunResult] = []
@@ -527,7 +551,14 @@ def run_pipeline(
             capture_stage(
                 "Stage 3C - Orderbook",
                 paths.stage3c,
-                lambda: run_stage3c_orderbook_filter(paths.stage2, paths.stage3b, paths.stage3c, paths.raw_orderbook, config),
+                lambda: run_stage3c_orderbook_filter(
+                    paths.stage2,
+                    paths.stage3b,
+                    paths.stage3c,
+                    paths.raw_orderbook,
+                    config,
+                    watchlist_path=paths.hybrid_watchlist,
+                ),
                 resume=resume,
             )
         )
@@ -564,20 +595,23 @@ def run_pipeline(
                 "Stage Hybrid - Dual Flow Watchlist",
                 paths.hybrid_watchlist,
                 lambda: run_hybrid_screener(
-                    input_path=paths.stage2,
+                            input_path=paths.stage4 if paths.stage4.exists() else paths.stage2,
                     output_path=paths.hybrid_watchlist,
                     mode=options.hybrid_mode,
                     capital_profile=options.hybrid_capital_profile,
                     config_path=options.hybrid_config_path,
-                    broker_flow_path=broker_path,
-                    orderbook_path=orderbook_path,
+                            broker_flow_path=None if paths.stage4.exists() else broker_path,
+                            orderbook_path=None if paths.stage4.exists() else orderbook_path,
                     date=options.run_date,
                     max_candidates=options.hybrid_max_candidates,
                     enable_market_regime=options.enable_market_regime,
                     enable_multibar_confirm=options.enable_multibar_confirm,
                     enable_adaptive_tp=options.enable_adaptive_tp,
                     enable_liquidity_sizer=options.enable_liquidity_sizer,
-                    enable_blackout=options.enable_blackout,
+                            enable_blackout=options.enable_blackout,
+                            capital=options.capital,
+                            risk_per_trade_pct=options.risk_per_trade_pct,
+                            max_position_pct=options.max_position_pct,
                 ),
                 resume=resume,
             )

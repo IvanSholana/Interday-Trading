@@ -114,9 +114,9 @@ def test_get_recommendation_policy_returns_json_manifest() -> None:
     result = mcp_server.get_recommendation_policy(output_format="json")
     payload = json.loads(result)
 
-    assert payload["schema_version"] == "recommendation-pack-v1"
+    assert payload["schema_version"] == "recommendation-pack-v2"
     assert payload["policy_version"] == "2026-07-professional-mvp-v1"
-    assert payload["policy"]["min_risk_reward"] == 1.2
+    assert payload["policy"]["min_risk_reward"] == 1.0
     assert "REVIEW_BUY" in payload["labels"]["execution_decisions"]
     assert "LOW_NET_PROFIT_AFTER_COSTS" in payload["labels"]["audit_flags"]
     assert "take_profit_1" in payload["column_aliases"]["tp1_price"]
@@ -468,9 +468,9 @@ def test_get_trade_recommendation_can_return_json(tmp_path, monkeypatch) -> None
     payload = json.loads(result)
 
     assert payload["primary"]["symbol"] == "PGEO"
-    assert payload["schema_version"] == "recommendation-pack-v1"
+    assert payload["schema_version"] == "recommendation-pack-v2"
     assert payload["policy_version"] == "2026-07-professional-mvp-v1"
-    assert payload["policy"]["min_expected_net_profit_idr"] == 5000.0
+    assert payload["policy"]["min_expected_net_profit_idr"] == 3000.0
     assert payload["max_position_pct"] == 0.20
     assert payload["primary"]["lots"] == 2
     assert payload["primary"]["execution_decision"] == "AVOID"
@@ -532,7 +532,7 @@ def test_get_execution_summary_returns_compact_json(tmp_path, monkeypatch) -> No
     )
     payload = json.loads(result)
 
-    assert payload["schema_version"] == "recommendation-pack-v1"
+    assert payload["schema_version"] == "recommendation-pack-v2"
     assert payload["primary"]["symbol"] == "PGEO"
     assert payload["primary"]["execution_decision"] == "WAIT_CONFIRMATION"
     assert payload["portfolio_decision"] == "WITHIN_BUDGET_REVIEW"
@@ -716,4 +716,3 @@ def test_get_ticker_stage_details(tmp_path, monkeypatch) -> None:
     
     res_md_missing = mcp_server.get_ticker_stage_details(run_id, "TLKM")
     assert "Ticker not present in Stage 1" in res_md_missing
-

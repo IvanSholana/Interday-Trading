@@ -438,9 +438,19 @@ def build_risk_plan(row: dict[str, Any], config: HybridScreenerConfig, capital_p
         entry = float(entry)
         target_tp_pct = float(target_tp_pct)
         stop_loss_pct = float(stop_loss_pct)
+        planned_tp1 = _safe_float(_first(row, ["take_profit_1", "tp1_price", "planned_take_profit_1"]))
+        planned_tp2 = _safe_float(_first(row, ["take_profit_2", "tp2_price", "planned_take_profit_2"]))
+        planned_stop = _safe_float(_first(row, ["stop_loss", "stop_loss_price", "planned_stop"]))
         
-        # 1. Take Profit Calculation (Adaptive vs Fixed)
-        if getattr(config.adaptive_tp, "mode", "adaptive") == "adaptive":
+        # Reuse Stage 4's executable price plan when available so the hybrid
+        # layer scores the same trade instead of inventing a second TP/SL.
+        if planned_tp1 is not None and planned_tp1 > entry and planned_stop is not None and 0 < planned_stop < entry:
+            tp1 = planned_tp1
+            tp2 = planned_tp2 if planned_tp2 is not None and planned_tp2 > tp1 else planned_tp1
+            stop_loss = planned_stop
+            target_tp_pct = (tp1 - entry) / entry
+            stop_loss_pct = (entry - stop_loss) / entry
+        elif getattr(config.adaptive_tp, "mode", "adaptive") == "adaptive":
             atr_pct = _safe_float(row.get("atr_pct"), 0.02)
             atr14 = atr_pct * entry
             high_20d = _safe_float(row.get("high_20d"))
@@ -456,10 +466,11 @@ def build_risk_plan(row: dict[str, Any], config: HybridScreenerConfig, capital_p
                 tp1 = entry * (1 + target_tp_pct)
                 tp2 = entry * (1 + max(target_tp_pct * 1.5, target_tp_pct + 0.01))
                 
-        try:
-            stop_loss = round_price_to_tick(entry * (1 - stop_loss_pct), "floor")
-        except ValueError:
-            stop_loss = entry * (1 - stop_loss_pct)
+        if planned_stop is None or not (0 < planned_stop < entry) or planned_tp1 is None or planned_tp1 <= entry:
+            try:
+                stop_loss = round_price_to_tick(entry * (1 - stop_loss_pct), "floor")
+            except ValueError:
+                stop_loss = entry * (1 - stop_loss_pct)
             
         # 2. Reconcile cash, capital, stop-risk and liquidity limits before and
         # after IDX lot rounding. Risk is never disabled with the liquidity
@@ -1270,11 +1281,34 @@ def run_hybrid_screener(
     enable_adaptive_tp: bool | None = None,
     enable_liquidity_sizer: bool | None = None,
     enable_blackout: bool | None = None,
+    capital: float | None = None,
+    risk_per_trade_pct: float | None = None,
+    max_position_pct: float | None = None,
 ) -> pd.DataFrame:
     config = load_hybrid_config(config_path)
     
     # Apply runtime overrides if passed
     from dataclasses import replace
+    if capital is not None or max_position_pct is not None:
+        profile = config.capital_profiles[capital_profile]
+        profile = replace(
+            profile,
+            capital=float(capital) if capital is not None else profile.capital,
+            max_position_pct=float(max_position_pct) if max_position_pct is not None else profile.max_position_pct,
+            max_stock_price=float(capital) / 100.0 if capital is not None else profile.max_stock_price,
+        )
+        profiles = dict(config.capital_profiles)
+        profiles[capital_profile] = profile
+        config = replace(config, capital_profiles=profiles)
+    if risk_per_trade_pct is not None:
+        config = replace(
+            config,
+            risk=replace(
+                config.risk,
+                risk_per_trade_pct=float(risk_per_trade_pct),
+                max_risk_per_trade_pct=float(risk_per_trade_pct),
+            ),
+        )
     if enable_market_regime is not None:
         config = replace(
             config,

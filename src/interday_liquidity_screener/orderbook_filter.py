@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
+from .constants import WatchlistStatus
 from .stockbit_collector import get_stockbit_token, parse_number
 
 ORDERBOOK_URL = "https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/{ticker}"
@@ -400,7 +401,11 @@ def build_orderbook_summary(row: dict[str, Any]) -> str:
     return "No usable orderbook data for execution-quality review."
 
 
-def load_orderbook_universe(stage2_path: str | Path, bandarmology_path: str | Path) -> pd.DataFrame:
+def load_orderbook_universe(
+    stage2_path: str | Path,
+    bandarmology_path: str | Path,
+    watchlist_path: str | Path | None = None,
+) -> pd.DataFrame:
     stage2 = pd.read_csv(stage2_path)
     bandar = pd.read_csv(bandarmology_path)
     merged = stage2.merge(
@@ -417,7 +422,29 @@ def load_orderbook_universe(stage2_path: str | Path, bandarmology_path: str | Pa
         & merged["bandarmology_signal"].isin(FETCH_SIGNALS)
         & ~merged["technical_context"].isin(SKIP_CONTEXTS)
     )
-    return merged[mask].copy()
+    selected_tickers = set(merged.loc[mask, "ticker"].astype(str))
+
+    # A morning resume must validate the candidates produced by the previous
+    # hybrid pass. The broker-flow filter alone can be much narrower than the
+    # safe-execution path (for example when broker data is unavailable), which
+    # previously left NEED_ORDERBOOK candidates permanently unresolved.
+    if watchlist_path and Path(watchlist_path).exists():
+        try:
+            watchlist = pd.read_csv(watchlist_path)
+        except pd.errors.EmptyDataError:
+            watchlist = pd.DataFrame()
+        ticker_column = "symbol" if "symbol" in watchlist.columns else "ticker"
+        live_confirmation_statuses = {
+            WatchlistStatus.NEED_ORDERBOOK.value,
+            WatchlistStatus.EXECUTION_DRAFT.value,
+            WatchlistStatus.EXECUTION_CANDIDATE.value,
+            WatchlistStatus.READY_SOON.value,
+        }
+        if ticker_column in watchlist.columns and "final_status" in watchlist.columns:
+            needs_live_confirmation = watchlist["final_status"].astype(str).isin(live_confirmation_statuses)
+            selected_tickers.update(watchlist.loc[needs_live_confirmation, ticker_column].dropna().astype(str))
+
+    return merged[merged["ticker"].astype(str).isin(selected_tickers)].copy()
 
 
 def run_stage3c_orderbook_filter(
@@ -426,9 +453,10 @@ def run_stage3c_orderbook_filter(
     output_path: str | Path,
     raw_dir: str | Path,
     config: OrderbookFilterConfig | None = None,
+    watchlist_path: str | Path | None = None,
 ) -> pd.DataFrame:
     config = config or OrderbookFilterConfig()
-    universe = load_orderbook_universe(stage2_path, bandarmology_path)
+    universe = load_orderbook_universe(stage2_path, bandarmology_path, watchlist_path=watchlist_path)
     token = get_stockbit_token()
     print(f"Stage 3C orderbook tickers: {len(universe)}")
     rows: list[dict[str, Any]] = []

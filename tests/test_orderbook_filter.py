@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import pandas as pd
+
+from interday_liquidity_screener.constants import WatchlistStatus
 from interday_liquidity_screener.orderbook_filter import (
     OrderbookFilterConfig,
     is_corp_action_active,
     is_notation_risky,
+    load_orderbook_universe,
     normalize_orderbook_payload,
 )
 
@@ -163,3 +167,51 @@ def test_supportive_orderbook() -> None:
     )
 
     assert row["orderbook_status"] == "ORDERBOOK_SUPPORTIVE"
+
+
+def test_morning_universe_includes_hybrid_candidates_needing_orderbook(tmp_path) -> None:
+    stage2_path = tmp_path / "stage2.csv"
+    bandar_path = tmp_path / "stage3b.csv"
+    watchlist_path = tmp_path / "hybrid.csv"
+    pd.DataFrame(
+        [
+            {
+                "ticker": "PGEO",
+                "is_data_valid": True,
+                "liquidity_bucket": "HIGH_LIQUIDITY",
+                "bandar_watch_eligible": True,
+                "technical_context": "BREAKOUT_NEAR",
+            },
+            {
+                "ticker": "MAPI",
+                "is_data_valid": True,
+                "liquidity_bucket": "HIGH_LIQUIDITY",
+                "bandar_watch_eligible": False,
+                "technical_context": "TOO_QUIET_ABSOLUTE",
+            },
+            {
+                "ticker": "SKIP",
+                "is_data_valid": True,
+                "liquidity_bucket": "HIGH_LIQUIDITY",
+                "bandar_watch_eligible": False,
+                "technical_context": "TOO_QUIET_ABSOLUTE",
+            },
+        ]
+    ).to_csv(stage2_path, index=False)
+    pd.DataFrame(
+        [
+            {"ticker": "PGEO", "broker_activity_available": True, "bandarmology_signal": "MILD_ACCUMULATION"},
+            {"ticker": "MAPI", "broker_activity_available": False, "bandarmology_signal": "NO_BROKER_DATA"},
+            {"ticker": "SKIP", "broker_activity_available": False, "bandarmology_signal": "NO_BROKER_DATA"},
+        ]
+    ).to_csv(bandar_path, index=False)
+    pd.DataFrame(
+        [
+            {"symbol": "MAPI", "final_status": WatchlistStatus.NEED_ORDERBOOK.value},
+            {"symbol": "SKIP", "final_status": WatchlistStatus.SKIP.value},
+        ]
+    ).to_csv(watchlist_path, index=False)
+
+    universe = load_orderbook_universe(stage2_path, bandar_path, watchlist_path)
+
+    assert set(universe["ticker"]) == {"PGEO", "MAPI"}

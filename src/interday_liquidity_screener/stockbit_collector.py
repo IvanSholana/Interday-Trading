@@ -179,6 +179,8 @@ def build_bandar_windows(
 
 
 def _load_dotenv(path: str | Path = ".env") -> None:
+    # Overwrites os.environ (not setdefault) so long-running processes pick up
+    # a rotated .env token instead of keeping a stale value cached in memory.
     env_path = Path(path)
     if not env_path.exists():
         return
@@ -187,7 +189,9 @@ def _load_dotenv(path: str | Path = ".env") -> None:
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
         key, value = stripped.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        cleaned_value = value.strip().strip('"').strip("'")
+        if cleaned_value:
+            os.environ[key.strip()] = cleaned_value
 
 
 def get_stockbit_token() -> str:
