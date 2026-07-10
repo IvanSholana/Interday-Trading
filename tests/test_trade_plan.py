@@ -445,14 +445,16 @@ def test_strategy_mode_defaults_remain_interday() -> None:
     assert config.force_exit_same_day is False
 
 
-def test_bpjs_strategy_defaults_are_intraday_execution_strict() -> None:
+def test_bpjs_strategy_defaults_allow_up_to_three_sessions() -> None:
     config = TradePlanConfig(strategy_mode="bpjs")
 
     assert config.tp1_pct == 0.02
     assert config.tp2_pct == 0.03
     assert config.max_stop_loss_pct == 0.015
-    assert config.force_exit_same_day is True
-    assert config.time_stop_days == 0
+    assert config.force_exit_same_day is False
+    assert config.time_stop_days == 3
+    assert config.max_position_pct == 1.0
+    assert config.risk_per_trade_pct == 0.01
     assert config.require_orderbook_confirmation is True
 
 

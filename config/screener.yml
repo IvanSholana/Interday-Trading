@@ -1,4 +1,15 @@
+corporate_action_db: data/cache/corporate_actions.sqlite
+
 capital_profiles:
+  capital_100k:
+    capital: 100000
+    max_position_pct: 1.0
+    max_stock_price: 1000
+    preferred_price_min: 50
+    preferred_price_max: 200
+    min_gross_tp_pct: 0.015
+    target_tp_pct_default: 0.02
+    stop_loss_pct_default: 0.01
   capital_500k:
     capital: 500000
     max_position_pct: 1.0
@@ -29,10 +40,12 @@ capital_profiles:
 
 fees:
   buy_fee_pct: 0.0015
-  sell_fee_pct: 0.0025
+  sell_fee_pct: 0.0015
+  sell_tax_pct: 0.001
   round_trip_fee_pct_fallback: 0.0045
   minimum_buy_fee: 0
   minimum_sell_fee: 0
+  estimated_spread_pct_default: 0
   slippage_pct_default: 0.001
 
 liquidity:
@@ -83,13 +96,19 @@ orderbook:
   top_levels: 5
 
 watchlist:
-  max_candidates_bpjs: 5
+  max_candidates_bpjs: 10
   max_candidates_default: 10
+  max_watchlist: 10
+  max_ready_soon: 3
+  max_execution_ready: 2
 
 risk:
   minimum_net_profit: 5000
   minimum_risk_reward: 1.2
   lot_size: 100
+  risk_per_trade_pct: 0.01
+  max_risk_per_trade_pct: 0.015
+  hard_max_loss_pct: 0.02
 
 safety:
   hard_skip_uma: true
@@ -98,4 +117,3 @@ safety:
   hard_skip_fca: true
   hard_market_regime_risk_off: false
   hard_sector_downtrend: false
-

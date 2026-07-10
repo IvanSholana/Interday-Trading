@@ -22,13 +22,15 @@ class ScheduledTask:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ScheduledTask:
+        strategy_mode = str(data.get("strategy_mode", "interday"))
+        default_max_position_pct = 1.0 if strategy_mode == "bpjs" else 0.2
         return cls(
             name=data["name"],
             time_str=data["time"],
-            strategy_mode=data.get("strategy_mode", "interday"),
+            strategy_mode=strategy_mode,
             tickers_file=data["tickers_file"],
             capital=float(data.get("capital", 500_000)),
-            max_position_pct=float(data.get("max_position_pct", 0.2)),
+            max_position_pct=float(data.get("max_position_pct", default_max_position_pct)),
             stages=data.get("stages", ["stage1", "stage2", "stage3a", "stage3b", "stage4"]),
         )
 

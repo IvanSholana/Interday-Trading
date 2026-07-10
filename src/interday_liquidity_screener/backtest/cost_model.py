@@ -54,7 +54,25 @@ class CostModel:
         if entry_price <= 0:
             return 0.0
         return_gross = exit_price / entry_price - 1
-        return return_gross - self._config.fee_buy_pct - self._config.fee_sell_pct
+        return (
+            return_gross
+            - self._config.fee_buy_pct
+            - self._config.fee_sell_pct
+            - self._config.sell_tax_pct
+            - self._config.estimated_spread_pct
+        )
+
+    def calculate_cost_breakdown(self, entry_price: float, exit_price: float, shares: int) -> dict[str, float]:
+        """Return fee, tax, spread and slippage components separately."""
+        entry_value = float(entry_price) * int(shares)
+        exit_value = float(exit_price) * int(shares)
+        return {
+            "buy_fee": entry_value * self._config.fee_buy_pct,
+            "sell_fee": exit_value * self._config.fee_sell_pct,
+            "sell_tax": exit_value * self._config.sell_tax_pct,
+            "estimated_spread_cost": entry_value * self._config.estimated_spread_pct,
+            "estimated_slippage_cost": (entry_value + exit_value) * self._config.slippage_pct,
+        }
 
     def snap_price_to_tick(self, price: float, mode: str = "nearest") -> float:
         """Bulatkan harga ke tick-size IDX yang valid.

@@ -51,6 +51,11 @@ class TradeSimulation:
     entry_setup: str | None = None
     technical_context: str | None = None
     bandarmology_signal: str | None = None
+    planned_entry: float | None = None
+    actual_entry: float | None = None
+    planned_lots: int = 0
+    actual_lots: int = 0
+    actual_risk_amount: float = 0.0
 
 
 class TradeSimulator:
@@ -133,6 +138,7 @@ class TradeSimulator:
         raw_exit_price: float | None = None
 
         for i, (bar_date, bar) in enumerate(bars_to_evaluate.iterrows()):
+            bar_open = float(bar["open"])
             bar_high = float(bar["high"])
             bar_low = float(bar["low"])
             bar_close = float(bar["close"])
@@ -151,12 +157,14 @@ class TradeSimulator:
                 # Conservative tie-breaking: choose SL (Req 1.4)
                 exit_event = "SL_HIT"
                 exit_date = pd.Timestamp(bar_date)
-                raw_exit_price = stop_loss
+                raw_exit_price = min(stop_loss, bar_open)
                 break
             elif sl_hit:
                 exit_event = "SL_HIT"
                 exit_date = pd.Timestamp(bar_date)
-                raw_exit_price = stop_loss
+                # A gap below the stop fills at the opening price, not at the
+                # stale planned stop level.
+                raw_exit_price = min(stop_loss, bar_open)
                 break
             elif tp_hit:
                 exit_event = "TP1_HIT"

@@ -218,8 +218,8 @@ class PipelineOptions:
     windows: str = "1D,3D,5D,10D,20D"
     strategy_mode: str = "interday"
     capital: float = 500_000
-    risk_per_trade_pct: float = 0.005
-    max_position_pct: float = 0.20
+    risk_per_trade_pct: float | None = None
+    max_position_pct: float | None = None
     bandarmology_min_score: int = 60
     stockbit_sleep_seconds: float = 3.0
     orderbook_sleep_seconds: float = 2.0

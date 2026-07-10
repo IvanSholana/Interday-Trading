@@ -1,3 +1,10 @@
+"""Legacy Stage-4 signal replay.
+
+This module does not recompute the pipeline point-in-time. New research should
+use ``backtest.walk_forward.WalkForwardPipelineBacktester``; the explicit
+``SignalReplayBacktester`` wrapper preserves this legacy workflow.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

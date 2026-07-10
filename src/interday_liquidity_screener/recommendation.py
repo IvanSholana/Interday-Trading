@@ -431,7 +431,10 @@ def _cost_adjusted_profit(
 
     exit_value = tp1 * lots * 100
     buy_fee = max(position_value * float(fees.buy_fee_pct), float(fees.minimum_buy_fee) if position_value else 0.0)
-    sell_fee = max(exit_value * float(fees.sell_fee_pct), float(fees.minimum_sell_fee) if position_value else 0.0)
+    sell_fee = max(
+        exit_value * (float(fees.sell_fee_pct) + float(fees.sell_tax_pct)),
+        float(fees.minimum_sell_fee) if position_value else 0.0,
+    )
     slippage = position_value * float(fees.slippage_pct_default) + exit_value * float(fees.slippage_pct_default)
     net_profit = expected_gross_profit - buy_fee - sell_fee - slippage
     return expected_gross_profit, buy_fee, sell_fee, slippage, net_profit

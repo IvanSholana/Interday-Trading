@@ -39,8 +39,12 @@ class AdjustedPriceHandler:
 
         result = df.copy()
 
-        # Preserve raw close
-        result["close_raw"] = result["close"].copy()
+        # Preserve every tradable field explicitly. ``close_raw`` remains as a
+        # public compatibility alias used by older callers.
+        for column in ("open", "high", "low", "close", "volume"):
+            if column in result.columns:
+                result[f"raw_{column}"] = result[column].copy()
+        result["close_raw"] = result["raw_close"].copy()
 
         has_adjusted = "adjusted_close" in result.columns
         result["adjusted_close_available"] = has_adjusted
@@ -48,15 +52,37 @@ class AdjustedPriceHandler:
         if has_adjusted:
             # Check if adjusted_close is actually different from close (corporate action exists)
             adj = result["adjusted_close"]
-            raw = result["close_raw"]
+            raw = result["raw_close"]
 
             # Fill NaN in adjusted_close with raw close (graceful fallback)
             adj_filled = adj.fillna(raw)
 
+            result["adjustment_factor"] = (adj_filled / raw).where(raw > 0, 1.0).fillna(1.0)
+            for column in ("open", "high", "low", "close"):
+                raw_column = f"raw_{column}"
+                if raw_column in result.columns:
+                    adjusted_column = f"adjusted_{column}"
+                    if adjusted_column not in result.columns:
+                        result[adjusted_column] = result[raw_column] * result["adjustment_factor"]
+            if "raw_volume" in result.columns:
+                valid_factor = result["adjustment_factor"].where(result["adjustment_factor"] > 0, 1.0)
+                if "adjusted_volume" not in result.columns:
+                    result["adjusted_volume"] = result["raw_volume"] / valid_factor
+
             if AdjustedPriceHandler.has_corporate_action(result):
-                # Use adjusted_close for indicator calculations
-                result["close"] = adj_filled
+                # Historical indicators use adjusted OHLCV; execution callers
+                # retain the raw_* fields for fills, ticks and cash accounting.
+                for column in ("open", "high", "low", "close", "volume"):
+                    adjusted_column = f"adjusted_{column}"
+                    if adjusted_column in result.columns:
+                        result[column] = result[adjusted_column]
             # else: keep close as-is (no corporate action, adjusted == raw)
+        else:
+            result["adjustment_factor"] = 1.0
+            for column in ("open", "high", "low", "close", "volume"):
+                raw_column = f"raw_{column}"
+                if raw_column in result.columns:
+                    result[f"adjusted_{column}"] = result[raw_column]
 
         return result
 
@@ -112,7 +138,11 @@ class AdjustedPriceHandler:
             return df if df is not None else pd.DataFrame()
 
         result = df.copy()
-        if "close_raw" in result.columns:
+        for column in ("open", "high", "low", "close", "volume"):
+            raw_column = f"raw_{column}"
+            if raw_column in result.columns:
+                result[column] = result[raw_column]
+        if "raw_close" not in result.columns and "close_raw" in result.columns:
             result["close"] = result["close_raw"]
         return result
 

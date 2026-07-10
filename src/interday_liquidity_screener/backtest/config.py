@@ -23,6 +23,8 @@ class CostModelConfig:
 
     fee_buy_pct: float = 0.0015
     fee_sell_pct: float = 0.0025
+    sell_tax_pct: float = 0.0
+    estimated_spread_pct: float = 0.0
     slippage_pct: float = 0.001
     snap_to_tick: bool = True
 
@@ -50,9 +52,15 @@ class BacktestConfig:
     min_sample_size: int = 30
     warmup_days: int = 200
     output_dir: str = "data/output/backtest"
+    initial_capital: float = 1_000_000
+    random_seed: int = 42
+    feature_version: str = "technical-v1"
+    strategy_version: str = "bpjs-v1"
 
     def __post_init__(self) -> None:
         """Validate fields after initialization."""
+        if self.initial_capital <= 0:
+            raise ValueError("initial_capital must be positive")
         # Validate time_stop_days: reject zero/negative, fallback to default
         if self.time_stop_days <= 0:
             object.__setattr__(self, "time_stop_days", _DEFAULT_TIME_STOP_DAYS)

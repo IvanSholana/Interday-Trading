@@ -89,7 +89,9 @@ def compute_metrics(ticker: str, df: pd.DataFrame | None, config: ScreenerConfig
 
         latest = clean_df.iloc[-1]
         data_points = len(clean_df)
-        last_20 = clean_df.tail(20)
+        # Prior-only baseline: the latest row is the decision bar and must not
+        # contribute to the rolling reference used to score itself.
+        last_20 = clean_df.iloc[:-1].tail(20)
 
         close = safe_float(latest["Close"])
         high = safe_float(latest["High"])
@@ -106,7 +108,13 @@ def compute_metrics(ticker: str, df: pd.DataFrame | None, config: ScreenerConfig
 
         volume_ratio = volume / avg_volume_20d if avg_volume_20d > 0 else None
         value_ratio = value_est / avg_value_20d if avg_value_20d > 0 else None
-        consistency = median_value_20d / avg_value_20d if avg_value_20d > 0 else None
+        # Consistency describes the observed 20-session distribution (including
+        # the decision bar), while relative-activity baselines above remain
+        # strictly prior-only.
+        observed_20 = clean_df.tail(20)
+        observed_avg_value = float(observed_20["value_est"].mean())
+        observed_median_value = float(observed_20["value_est"].median())
+        consistency = observed_median_value / observed_avg_value if observed_avg_value > 0 else None
 
         high_20d = float(last_20["High"].max())
         low_20d = float(last_20["Low"].min())
@@ -143,11 +151,11 @@ def compute_metrics(ticker: str, df: pd.DataFrame | None, config: ScreenerConfig
                 "zero_volume_days_20d": zero_volume_days_20d,
                 "value_consistency_ratio": consistency,
                 "data_points": data_points,
-                "is_data_valid": data_points >= 20,
+                "is_data_valid": data_points >= 21,
             }
         )
 
-        if data_points < 20:
+        if data_points < 21:
             result["reason"] = "insufficient_history"
 
         return apply_screening_labels(result, config)

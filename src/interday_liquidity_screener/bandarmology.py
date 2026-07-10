@@ -67,6 +67,29 @@ def calculate_hhi(values: list[float] | pd.Series) -> float:
     return float((shares**2).sum())
 
 
+def normalize_broker_flow(
+    net_flow_value: float,
+    *,
+    avg_daily_value: float | None = None,
+    traded_value: float | None = None,
+    historical_net_flows: list[float] | pd.Series | None = None,
+    free_float_market_cap: float | None = None,
+) -> dict[str, float | None]:
+    """Scale broker net flow without mixing in technical confirmation."""
+    net_flow = float(net_flow_value)
+    history = pd.Series(historical_net_flows, dtype="float64").dropna() if historical_net_flows is not None else pd.Series(dtype="float64")
+    zscore = None
+    if len(history) >= 5 and float(history.std(ddof=0)) > 0:
+        zscore = (net_flow - float(history.mean())) / float(history.std(ddof=0))
+    return {
+        "broker_net_flow_value": net_flow,
+        "broker_flow_to_avg_value": net_flow / float(avg_daily_value) if avg_daily_value and avg_daily_value > 0 else None,
+        "broker_flow_to_traded_value": net_flow / float(traded_value) if traded_value and traded_value > 0 else None,
+        "broker_flow_to_free_float": net_flow / float(free_float_market_cap) if free_float_market_cap and free_float_market_cap > 0 else None,
+        "broker_flow_zscore": zscore,
+    }
+
+
 def _top_side(group: pd.DataFrame, side: str, count: int = 3) -> dict[str, Any]:
     side_group = group[group["side"] == side].dropna(subset=["net_value"]).copy()
     side_group["abs_net_value"] = side_group["net_value"].abs()
@@ -103,11 +126,21 @@ def calculate_broker_features(df: pd.DataFrame) -> pd.DataFrame:
         row["top3_seller_value"] = float(seller_values.sort_values(ascending=False).head(3).sum())
         row["buyer_hhi"] = calculate_hhi(buyer_values)
         row["seller_hhi"] = calculate_hhi(seller_values)
-        # top3_buyer_dominance: ratio of top3 buyer value vs top3 seller value
+        # Bounded shares remain stable when one side is near zero; unlike an
+        # unbounded buyer/seller ratio they cannot become infinity.
         top3_buy = row["top3_buyer_value"]
         top3_sell = row["top3_seller_value"]
-        row["top3_buyer_dominance"] = top3_buy / top3_sell if top3_sell > 0 else (None if top3_buy == 0 else float("inf"))
-        row["top3_seller_dominance"] = top3_sell / top3_buy if top3_buy > 0 else (None if top3_sell == 0 else float("inf"))
+        dominance_total = top3_buy + top3_sell
+        row["top3_buyer_dominance"] = top3_buy / dominance_total if dominance_total > 0 else None
+        row["top3_seller_dominance"] = top3_sell / dominance_total if dominance_total > 0 else None
+        row["top3_dominance_total_value"] = dominance_total
+        row["broker_flow_coverage_pct"] = 100.0 if dominance_total > 0 else 0.0
+        net_flow_value = float(buyer_values.sum() - seller_values.sum())
+        avg_daily_value = group["avg_value_20d"].dropna().iloc[0] if "avg_value_20d" in group and group["avg_value_20d"].notna().any() else None
+        traded_value = group["traded_value"].dropna().iloc[0] if "traded_value" in group and group["traded_value"].notna().any() else None
+        free_float = group["free_float_market_cap"].dropna().iloc[0] if "free_float_market_cap" in group and group["free_float_market_cap"].notna().any() else None
+        row.update(normalize_broker_flow(net_flow_value, avg_daily_value=avg_daily_value,
+                                         traded_value=traded_value, free_float_market_cap=free_float))
         row["top_buyer_avg_price"] = row.get("top_buyer_1_avg_price")
         row["top_seller_avg_price"] = row.get("top_seller_1_avg_price")
         row["broker_activity_available"] = bool(buyer_values.sum() > 0 or seller_values.sum() > 0)
@@ -165,21 +198,10 @@ def score_single_window(row: dict[str, Any] | pd.Series, stage2_row: dict[str, A
         elif float(avg_amount) < 0:
             score -= 5
 
-    if merged.get("relative_activity_bucket") in {"NORMAL", "NORMAL_TO_QUIET", "ACTIVE", "VERY_ACTIVE"}:
-        score += 5
-    if _value(merged, "close_location") >= 0.6:
-        score += 5
-    if _value(merged, "momentum_score") >= 60:
-        score += 5
-    if merged.get("technical_context") in SUPPORTIVE_CONTEXTS:
-        score += 5
-
     detector_avg = _value(merged, "detector_average_price")
     close = _value(merged, "close")
     if detector_avg > 0 and close > detector_avg * 1.10:
         score -= 10
-    if merged.get("technical_context") in {"TOO_VOLATILE", "TOO_QUIET_ABSOLUTE", "INVALID_DATA"}:
-        score -= 20
 
     # === P1 Task 7: Enhanced contributions ===
     # 1. Buyer HHI (konsentrasi beli — sinyal satu/beberapa bandar besar dominan)
@@ -191,24 +213,37 @@ def score_single_window(row: dict[str, Any] | pd.Series, stage2_row: dict[str, A
         elif buyer_hhi >= 0.15:
             score += 5
 
-    # 2. Top3 Dominance (ratio top3 buyer vs top3 seller)
+    flow_zscore = merged.get("broker_flow_zscore")
+    if flow_zscore is not None and pd.notna(flow_zscore):
+        if float(flow_zscore) >= 2:
+            score += 10
+        elif float(flow_zscore) >= 1:
+            score += 5
+        elif float(flow_zscore) <= -2:
+            score -= 10
+        elif float(flow_zscore) <= -1:
+            score -= 5
+
+    # 2. Top3 bounded buyer share. Technical confirmation is intentionally not
+    # included here; it is scored separately by the hybrid alpha component.
     top3_buyer = merged.get("top3_buyer_value")
     top3_seller = merged.get("top3_seller_value")
+    buyer_share = merged.get("top3_buyer_dominance")
+    coverage_pct = _value(merged, "broker_flow_coverage_pct", 100.0)
     if (
-        top3_buyer is not None
-        and top3_seller is not None
-        and pd.notna(top3_buyer)
-        and pd.notna(top3_seller)
-        and float(top3_seller) > 0
+        (buyer_share is not None and pd.notna(buyer_share))
+        or (top3_buyer is not None and top3_seller is not None and pd.notna(top3_buyer) and pd.notna(top3_seller))
     ):
-        dominance_ratio = float(top3_buyer) / float(top3_seller)
-        if dominance_ratio >= 2.0:
+        if buyer_share is None or pd.isna(buyer_share):
+            denominator = float(top3_buyer) + float(top3_seller)
+            buyer_share = float(top3_buyer) / denominator if denominator > 0 else None
+        if buyer_share is not None and coverage_pct >= 40 and float(buyer_share) >= 2 / 3:
             score += 10
-        elif dominance_ratio >= 1.3:
+        elif buyer_share is not None and coverage_pct >= 40 and float(buyer_share) >= 0.565:
             score += 5
-        elif dominance_ratio <= 0.5:
+        elif buyer_share is not None and coverage_pct >= 40 and float(buyer_share) <= 1 / 3:
             score -= 10
-        elif dominance_ratio <= 0.75:
+        elif buyer_share is not None and coverage_pct >= 40 and float(buyer_share) <= 0.43:
             score -= 5
 
     # 3. Close vs Top Buyer Avg (risiko distribusi jika harga jauh di atas avg beli bandar)

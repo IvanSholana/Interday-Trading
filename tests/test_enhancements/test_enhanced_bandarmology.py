@@ -193,6 +193,6 @@ class TestCalculateBrokerFeaturesDominance:
         row = features.iloc[0]
         assert "top3_buyer_dominance" in row.index
         assert row["top3_buyer_dominance"] is not None
-        # top3_buyer_value = 1B + 500M + 300M = 1.8B
-        # top3_seller_value = 200M + 100M = 300M (abs values)
-        assert row["top3_buyer_dominance"] == 1_800_000_000 / 300_000_000
+        # Bounded buyer share = 1.8B / (1.8B + 0.3B)
+        assert row["top3_buyer_dominance"] == 1_800_000_000 / 2_100_000_000
+        assert row["top3_seller_dominance"] == 300_000_000 / 2_100_000_000

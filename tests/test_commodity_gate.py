@@ -66,7 +66,7 @@ def test_score_sector_strength_commodity_penalty(monkeypatch) -> None:
     assert res.score == 60.0
     assert "COMMODITY_HEADWIND" in res.flags
 
-def test_determine_status_commodity_headwind() -> None:
+def test_commodity_headwind_is_soft_score_not_hard_gate() -> None:
     row = {"symbol": "ADRO"}
     scores = {
         "liquidity": ScoreResult(80, ()),
@@ -81,7 +81,7 @@ def test_determine_status_commodity_headwind() -> None:
     risk.skip_reasons = []
     
     status = determine_status(row, scores, risk, [], "both", "normal_execution")
-    assert status == WatchlistStatus.COMMODITY_HEADWIND
+    assert status == WatchlistStatus.EXECUTION_DRAFT
 
 def test_status_reason_summary_metadata() -> None:
     reason, summary = _status_reason_summary("COMMODITY_HEADWIND")
@@ -128,5 +128,4 @@ def test_market_regime_decoupling() -> None:
     
     assert config.market_regime.enabled is False
     assert config.safety.hard_market_regime_risk_off is False
-
 

@@ -5,6 +5,7 @@ from typing import Any
 
 import pandas as pd
 
+from .adjusted_price import AdjustedPriceHandler
 from .market_data_cache import DEFAULT_MARKET_DATA_DB, get_incremental_ohlcv, get_incremental_ohlcv_batch, normalize_ohlcv_frame
 
 LIQUID_BUCKETS = {"HIGH_LIQUIDITY", "GOOD_LIQUIDITY"}
@@ -28,6 +29,9 @@ TECHNICAL_OUTPUT_COLUMNS = [
     "yahoo_ticker",
     "last_date",
     "close",
+    "raw_close",
+    "adjusted_close",
+    "adjustment_factor",
     "volume",
     "value_est",
     "liquidity_bucket",
@@ -192,7 +196,7 @@ def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    features = df.copy()
+    features = AdjustedPriceHandler.prepare_dual_price(df)
     required = {"open", "high", "low", "close", "volume"}
     missing = required.difference(features.columns)
     if missing:
@@ -209,18 +213,21 @@ def calculate_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     features["atr14"] = calculate_atr(features, 14)
     features["atr_pct"] = features["atr14"] / features["close"]
     features["volatility_20d"] = features["close"].pct_change().rolling(20, min_periods=20).std()
-    features["avg_volume_20d"] = features["volume"].rolling(20, min_periods=20).mean()
-    features["avg_value_20d"] = features["value_est"].rolling(20, min_periods=20).mean()
+    # Decision-bar activity is compared with information available before that
+    # bar. Including the current bar in its own baseline leaks the observation
+    # being scored and systematically dampens relative-volume breakouts.
+    features["avg_volume_20d"] = features["volume"].rolling(20, min_periods=20).mean().shift(1)
+    features["avg_value_20d"] = features["value_est"].rolling(20, min_periods=20).mean().shift(1)
     features["volume_ratio"] = features["volume"] / features["avg_volume_20d"]
     features["value_ratio"] = features["value_est"] / features["avg_value_20d"]
 
     for period in [1, 3, 5, 10, 20]:
         features[f"return_{period}d"] = features["close"].pct_change(period)
 
-    features["high_20d"] = features["high"].rolling(20, min_periods=20).max()
-    features["low_20d"] = features["low"].rolling(20, min_periods=20).min()
-    features["high_60d"] = features["high"].rolling(60, min_periods=60).max()
-    features["low_60d"] = features["low"].rolling(60, min_periods=60).min()
+    features["high_20d"] = features["high"].rolling(20, min_periods=20).max().shift(1)
+    features["low_20d"] = features["low"].rolling(20, min_periods=20).min().shift(1)
+    features["high_60d"] = features["high"].rolling(60, min_periods=60).max().shift(1)
+    features["low_60d"] = features["low"].rolling(60, min_periods=60).min().shift(1)
 
     features["distance_to_20d_high"] = (features["high_20d"] - features["close"]) / features["close"]
     features["distance_from_20d_low"] = (features["close"] - features["low_20d"]) / features["close"]
@@ -665,6 +672,11 @@ def build_latest_technical_row(stage_1_row: dict[str, Any] | pd.Series, history:
     result["technical_context_summary"] = build_technical_context_summary(result)
     result["technical_reason"] = build_technical_reason(result)
     result["signal_summary"] = build_signal_summary(result)
+    # Indicators and classifications above intentionally use adjusted prices.
+    # Downstream trade planning receives the raw tradable close explicitly.
+    if pd.notna(result.get("raw_close")):
+        result["adjusted_close"] = result.get("close")
+        result["close"] = result["raw_close"]
     return result
 
 

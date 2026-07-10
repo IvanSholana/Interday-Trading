@@ -7,6 +7,8 @@ from typing import Any
 
 import pandas as pd
 
+from .bpjs_config import DEFAULT_BPJS_PROFILE
+
 ACTIONABLE_SETUPS = {
     "WATCH_ENTRY",
     "BREAKOUT_CANDIDATE",
@@ -393,9 +395,9 @@ STAGE3_OUTPUT_COLUMNS = [
 @dataclass(frozen=True)
 class TradePlanConfig:
     capital: float = 500_000
-    risk_per_trade_pct: float = 0.005
-    max_risk_per_trade_pct: float = 0.01
-    max_position_pct: float = 0.20
+    risk_per_trade_pct: float | None = None
+    max_risk_per_trade_pct: float | None = None
+    max_position_pct: float | None = None
     tp1_pct: float | None = None
     tp2_pct: float | None = None
     max_stop_loss_pct: float | None = None
@@ -420,6 +422,9 @@ class TradePlanConfig:
 
         defaults = {
             "interday": {
+                "risk_per_trade_pct": 0.005,
+                "max_risk_per_trade_pct": 0.01,
+                "max_position_pct": 0.20,
                 "tp1_pct": 0.05,
                 "tp2_pct": 0.08,
                 "max_stop_loss_pct": 0.08,
@@ -428,12 +433,15 @@ class TradePlanConfig:
                 "force_exit_same_day": False,
             },
             "bpjs": {
-                "tp1_pct": 0.02,
-                "tp2_pct": 0.03,
-                "max_stop_loss_pct": 0.015,
-                "time_stop_days": 0,
+                "risk_per_trade_pct": DEFAULT_BPJS_PROFILE.risk_per_trade_pct,
+                "max_risk_per_trade_pct": DEFAULT_BPJS_PROFILE.max_risk_per_trade_pct,
+                "max_position_pct": DEFAULT_BPJS_PROFILE.max_position_pct,
+                "tp1_pct": DEFAULT_BPJS_PROFILE.target_tp1_pct,
+                "tp2_pct": DEFAULT_BPJS_PROFILE.target_tp2_pct,
+                "max_stop_loss_pct": DEFAULT_BPJS_PROFILE.maximum_stop_loss_pct,
+                "time_stop_days": DEFAULT_BPJS_PROFILE.maximum_holding_sessions,
                 "require_orderbook_confirmation": True,
-                "force_exit_same_day": True,
+                "force_exit_same_day": False,
             },
         }[mode]
         for field_name, default_value in defaults.items():
@@ -442,7 +450,7 @@ class TradePlanConfig:
 
     @property
     def risk_amount(self) -> float:
-        bounded_risk_pct = min(self.risk_per_trade_pct, self.max_risk_per_trade_pct)
+        bounded_risk_pct = min(float(self.risk_per_trade_pct), float(self.max_risk_per_trade_pct))
         return self.capital * bounded_risk_pct
 
 

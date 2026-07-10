@@ -74,6 +74,12 @@ class WatchlistStatus(str, Enum):
 
     # --- Neutral ---
     SKIP = "SKIP"
+
+    # Canonical BPJS funnel labels. Legacy granular statuses remain available
+    # for compatibility and are mapped to these labels in screener output.
+    WATCHLIST = "WATCHLIST"
+    REJECT = "REJECT"
+    NO_TRADE = "NO_TRADE"
     """
     Screener ran successfully but stock did not meet minimum thresholds.
     Not a rejection due to risk — just filtered out.

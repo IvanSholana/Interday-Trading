@@ -96,10 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
     stage4.add_argument("--orderbook", default=None)
     stage4.add_argument("--output", default="data/output/stage4_trade_plan.csv")
     stage4.add_argument("--strategy-mode", choices=["interday", "bpjs"], default="interday")
-    stage4.add_argument("--capital", type=float, default=10_000_000)
-    stage4.add_argument("--risk-per-trade-pct", type=float, default=0.005)
-    stage4.add_argument("--max-risk-per-trade-pct", type=float, default=0.01)
-    stage4.add_argument("--max-position-pct", type=float, default=0.20)
+    stage4.add_argument("--capital", type=float, default=None)
+    stage4.add_argument("--risk-per-trade-pct", type=float, default=None)
+    stage4.add_argument("--max-risk-per-trade-pct", type=float, default=None)
+    stage4.add_argument("--max-position-pct", type=float, default=None)
     stage4.add_argument("--tp1-pct", type=float, default=None)
     stage4.add_argument("--tp2-pct", type=float, default=None)
     stage4.add_argument("--max-stop-loss-pct", type=float, default=None)
@@ -269,7 +269,7 @@ def main() -> None:
     elif args.command == "stage4":
         config = TradePlanConfig(
             strategy_mode=args.strategy_mode,
-            capital=args.capital,
+            capital=args.capital if args.capital is not None else (500_000 if args.strategy_mode == "bpjs" else 10_000_000),
             risk_per_trade_pct=args.risk_per_trade_pct,
             max_risk_per_trade_pct=args.max_risk_per_trade_pct,
             max_position_pct=args.max_position_pct,

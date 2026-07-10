@@ -9,6 +9,10 @@ from .orderbook_filter import is_corp_action_active, is_notation_risky
 from .trade_plan import get_idx_tick_size, round_price_to_tick
 from .market_data_cache import MarketDataCache, DEFAULT_MARKET_DATA_DB, normalize_ohlcv_frame
 from .constants import WatchlistStatus
+from .corporate_action_store import CorporateActionStore
+from .position_sizing import calculate_position_size
+from .scoring import rank_bpjs_candidate
+from .strategies import evaluate_strategy
 from .hybrid_config import (
     HYBRID_MODES,
     OUTPUT_COLUMNS,
@@ -28,6 +32,7 @@ from .hybrid_config import (
     WatchlistConfig,
     config_from_dict,
     load_hybrid_config,
+    hybrid_config_hash,
 )
 from .hybrid_utils import (
     clip_score as _clip,
@@ -41,7 +46,6 @@ from .enhancements import (
     MultiBarConfirmation,
     BlackoutFilter,
     AdaptiveTakeProfit,
-    LiquidityPositionSizer,
 )
 
 
@@ -457,48 +461,55 @@ def build_risk_plan(row: dict[str, Any], config: HybridScreenerConfig, capital_p
         except ValueError:
             stop_loss = entry * (1 - stop_loss_pct)
             
-        # 2. Position Sizer Calculation (Liquidity Capped vs Capital Capped)
-        max_position_value = float(profile.capital) * float(profile.max_position_pct)
-        lot_value = entry * float(config.risk.lot_size)
-        
-        # Apply Position Sizer if enabled
-        if getattr(config.liquidity_sizer, "enabled", False):
-            # Calculate Risk and Capital limits
-            risk_per_trade_pct = getattr(config.risk, "risk_per_trade_pct", 0.005)
-            risk_amount_cap = float(profile.capital) * float(risk_per_trade_pct)
-            risk_per_lot = (entry - float(stop_loss)) * float(config.risk.lot_size)
-            risk_based_lots = int(risk_amount_cap // risk_per_lot) if risk_per_lot > 0 else int(max_position_value // lot_value)
-            risk_based_value = risk_based_lots * lot_value
-            capital_based_value = max_position_value
-            
-            avg_value_20d = _safe_float(row.get("avg_value_20d"), 5_000_000_000)
-            sizer = LiquidityPositionSizer(config.liquidity_sizer)
-            position_value, constraint = sizer.apply_limit(
-                risk_based_value=risk_based_value,
-                capital_based_value=capital_based_value,
-                avg_value_20d=avg_value_20d
-            )
-            if constraint == "LIQUIDITY":
-                warnings.append("position_size_capped_by_liquidity")
-            lot = int(position_value // lot_value) if lot_value > 0 else 0
-        else:
-            lot = int(max_position_value // lot_value) if lot_value > 0 else 0
-            position_value = lot * lot_value
+        # 2. Reconcile cash, capital, stop-risk and liquidity limits before and
+        # after IDX lot rounding. Risk is never disabled with the liquidity
+        # toggle; the toggle controls only the liquidity constraint.
+        avg_value_20d = _safe_float(row.get("avg_value_20d"))
+        sizing = calculate_position_size(
+            capital=float(profile.capital),
+            available_cash=_safe_float(row.get("available_cash"), float(profile.capital)),
+            entry_price=entry,
+            stop_price=float(stop_loss),
+            risk_per_trade_pct=float(config.risk.risk_per_trade_pct),
+            max_risk_per_trade_pct=float(config.risk.max_risk_per_trade_pct),
+            max_position_pct=float(profile.max_position_pct),
+            avg_value_20d=avg_value_20d,
+            liquidity_participation_limit_pct=float(config.liquidity_sizer.max_pct_of_avg_value_20d),
+            liquidity_sizer_enabled=bool(config.liquidity_sizer.enabled),
+            buy_fee_pct=float(fees.buy_fee_pct),
+            slippage_pct=float(fees.slippage_pct_default),
+            lot_size=int(config.risk.lot_size),
+        )
+        lot = sizing.planned_lots
+        position_value = sizing.actual_position_value
+        if sizing.binding_constraint == "LIQUIDITY":
+            warnings.append("position_size_capped_by_liquidity")
+        if sizing.rejection_reason == "INVALID_STOP_DISTANCE":
+            skip_reasons.append("SKIP_INVALID_STOP")
+        elif sizing.rejection_reason == "ONE_LOT_RISK_EXCEEDS_MAX":
+            skip_reasons.append("SKIP_RISK_LIMIT")
+        elif sizing.rejection_reason:
+            skip_reasons.append("TOO_EXPENSIVE_FOR_CAPITAL")
         affordable_lot = lot >= 1
         if not affordable_lot:
             skip_reasons.append("TOO_EXPENSIVE_FOR_CAPITAL")
         if entry > float(profile.max_stock_price):
             skip_reasons.append("TOO_EXPENSIVE_FOR_CAPITAL")
         
-        position_value = lot * lot_value
         estimated_buy_fee = max(position_value * float(fees.buy_fee_pct), float(fees.minimum_buy_fee) if position_value else 0)
-        estimated_sell_fee = max((lot * float(config.risk.lot_size) * float(tp1)) * float(fees.sell_fee_pct), float(fees.minimum_sell_fee) if position_value else 0)
-        estimated_slippage = position_value * float(fees.slippage_pct_default) + (lot * float(config.risk.lot_size) * float(tp1) * float(fees.slippage_pct_default))
+        sale_value = lot * float(config.risk.lot_size) * float(tp1)
+        estimated_sell_fee = max(sale_value * (float(fees.sell_fee_pct) + float(fees.sell_tax_pct)), float(fees.minimum_sell_fee) if position_value else 0)
+        spread_pct = _safe_float(row.get("spread_pct"), float(fees.estimated_spread_pct_default))
+        estimated_slippage = (
+            position_value * (float(fees.slippage_pct_default) + spread_pct)
+            + sale_value * float(fees.slippage_pct_default)
+        )
         gross_profit = max(0.0, (float(tp1) - entry) * lot * float(config.risk.lot_size))
         net_profit = gross_profit - estimated_buy_fee - estimated_sell_fee - estimated_slippage
         risk_amount = max(0.0, (entry - float(stop_loss)) * lot * float(config.risk.lot_size))
         reward_amount = gross_profit
-        risk_reward_ratio = reward_amount / risk_amount if risk_amount > 0 else 0.0
+        expected_net_return_pct = net_profit / position_value if position_value > 0 else 0.0
+        risk_reward_ratio = net_profit / risk_amount if risk_amount > 0 else 0.0
         if target_tp_pct < float(profile.min_gross_tp_pct):
             skip_reasons.append("NET_PROFIT_NOT_WORTH_IT")
             warnings.append("target_tp_below_profile_min_gross_tp")
@@ -543,6 +554,20 @@ def build_risk_plan(row: dict[str, Any], config: HybridScreenerConfig, capital_p
             _clip(net_score),
             tuple(warnings),
             tuple(dict.fromkeys(skip_reasons)),
+            expected_net_return_pct,
+            risk_reward_ratio,
+            sizing.risk_budget_amount,
+            sizing.risk_based_limit,
+            sizing.capital_based_limit,
+            sizing.liquidity_based_limit,
+            sizing.available_cash_limit,
+            sizing.binding_constraint,
+            sizing.actual_cash_required,
+            sizing.actual_risk_pct,
+            sizing.capital_utilization_pct,
+            sizing.liquidity_participation_pct,
+            sizing.estimated_transaction_cost,
+            sizing.rejection_reason,
         )
     except Exception as e:
         print(f"Warning: build_risk_plan error for entry={entry}: {e}")
@@ -585,9 +610,9 @@ def stage0_safety(row: dict[str, Any], scores: dict[str, ScoreResult], risk: Ris
     if is_blackout:
         skip_reasons.append("SKIP_BLACKOUT_WINDOW")
     if "DANGER_CHASING" in scores["price_extension"].flags:
-        skip_reasons.append("DANGER_CHASING")
+        warnings.append("danger_chasing_soft_penalty")
     if "STRONG_DISTRIBUTION" in scores["smart_money"].flags:
-        skip_reasons.append("DISTRIBUTION_WARNING")
+        warnings.append("strong_distribution_soft_penalty")
     if cfg.hard_market_regime_risk_off and "MARKET_RISK_OFF" in scores["market_regime"].flags:
         skip_reasons.append("SKIP_MARKET_RISK_OFF")
     if cfg.hard_sector_downtrend and "SECTOR_DOWNTREND" in scores["sector_strength"].flags:
@@ -665,9 +690,6 @@ def determine_status(
         return WatchlistStatus.DANGER_CHASING
     if WatchlistStatus.DISTRIBUTION_WARNING.value in skip_reasons:
         return WatchlistStatus.DISTRIBUTION_WARNING
-    if "COMMODITY_HEADWIND" in scores["sector_strength"].flags:
-        return WatchlistStatus.COMMODITY_HEADWIND
-    
     # Smart Money Watch Path: strong accumulation but no technical trigger
     if scores["smart_money"].score >= 70 and scores["technical"].score < 60:
         if scores["technical"].score >= 45:
@@ -755,6 +777,43 @@ def build_explanation(status: str, scores: dict[str, ScoreResult], risk: RiskPla
     return f"SKIP because {reason_text}.{warning_text}"
 
 
+def assess_data_quality(row: dict[str, Any]) -> tuple[float, list[str], list[str], float, str]:
+    """Return coverage and confidence without treating optional data as a gate."""
+
+    required = {
+        "symbol": bool(row.get("symbol")),
+        "close": _safe_float(row.get("close")) is not None,
+        "avg_value_20d": _safe_float(row.get("avg_value_20d")) is not None,
+    }
+    optional = {
+        "broker_flow": _safe_bool(row.get("broker_activity_available"))
+        or _safe_float(row.get("accumulation_window_count")) is not None,
+        "sector_strength": _safe_float(row.get("sector_strength_score")) is not None,
+        "orderbook": orderbook_available(row),
+        "market_breadth": _safe_float(row.get("market_breadth_score")) is not None,
+        "tp_probability_estimate": _safe_float(row.get("estimated_tp_probability")) is not None,
+    }
+    missing_required = [name for name, available in required.items() if not available]
+    missing_optional = [name for name, available in optional.items() if not available]
+    available_count = sum(required.values()) + sum(optional.values())
+    coverage = 100.0 * available_count / (len(required) + len(optional))
+    data_quality = max(0.0, coverage - 20.0 * len(missing_required))
+    confidence = "HIGH" if data_quality >= 85 else "MEDIUM" if data_quality >= 65 else "LOW"
+    return coverage, missing_required, missing_optional, data_quality, confidence
+
+
+def to_funnel_status(status: WatchlistStatus) -> WatchlistStatus:
+    """Map granular compatibility statuses to the canonical BPJS funnel."""
+
+    if status == WatchlistStatus.EXECUTION_READY:
+        return WatchlistStatus.EXECUTION_READY
+    if status in {WatchlistStatus.READY_SOON, WatchlistStatus.NEED_ORDERBOOK, WatchlistStatus.EXECUTION_DRAFT, WatchlistStatus.EXECUTION_CANDIDATE}:
+        return WatchlistStatus.READY_SOON
+    if status in {WatchlistStatus.EARLY_WATCH, WatchlistStatus.ORDERBOOK_WEAK}:
+        return WatchlistStatus.WATCHLIST
+    return WatchlistStatus.REJECT
+
+
 def build_output_row(
     row: dict[str, Any],
     mode: str,
@@ -762,17 +821,21 @@ def build_output_row(
     config: HybridScreenerConfig,
     ticker_history: pd.DataFrame | None = None,
     blackout_events: dict[str, list[pd.Timestamp]] | None = None,
+    corporate_action_store: CorporateActionStore | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_candidate_row(row)
     
     # 1. Evaluate Blackout Filter
     is_blackout = False
-    if config.blackout.enabled and blackout_events is not None:
+    if config.blackout.enabled and (blackout_events is not None or corporate_action_store is not None):
         ticker = str(normalized.get("symbol", row.get("ticker", ""))).replace(".JK", "")
         decision_date = pd.Timestamp(normalized.get("date")) if normalized.get("date") else None
         if ticker and decision_date:
             flt = BlackoutFilter(config.blackout)
-            is_blackout = flt.is_in_blackout(ticker, decision_date, blackout_events)
+            known_events = dict(blackout_events or {})
+            if corporate_action_store is not None:
+                known_events[ticker] = corporate_action_store.blackout_dates_as_of(decision_date, ticker)
+            is_blackout = flt.is_in_blackout(ticker, decision_date, known_events)
             
     # 2. Evaluate Multi-Bar Confirmation
     multibar_status = "CONFIRMED"
@@ -799,6 +862,7 @@ def build_output_row(
         "orderbook": score_orderbook(normalized, config, mode),
     }
     risk = build_risk_plan(normalized, config, capital_profile, mode)
+    strategy = evaluate_strategy(normalized)
     flow_source = determine_flow_source(scores, risk)
     safety_skip, safety_warnings = stage0_safety(normalized, scores, risk, config, is_blackout=is_blackout)
     warnings = list(dict.fromkeys([*safety_warnings, *risk.warnings, *[warning for score in scores.values() for warning in score.warnings]]))
@@ -806,7 +870,32 @@ def build_output_row(
         warnings.append("inside_corporate_action_blackout_window")
     skip_reasons = list(dict.fromkeys([*safety_skip, *risk.skip_reasons]))
     status = determine_status(normalized, scores, risk, skip_reasons, flow_source, mode, multibar_status=multibar_status)
-    final_score = calculate_final_score(scores, risk, mode, config)
+    coverage, missing_required, missing_optional, data_quality, confidence = assess_data_quality(normalized)
+    if missing_required:
+        status = WatchlistStatus.DATA_INSUFFICIENT
+        skip_reasons.append("SKIP_REQUIRED_DATA")
+    market_context_score = _combined_market_sector(float(scores["market_regime"].score), float(scores["sector_strength"].score))
+    ranking = rank_bpjs_candidate(
+        technical=float(scores["technical"].score), smart_money=float(scores["smart_money"].score),
+        price_extension=float(scores["price_extension"].score), market_context=market_context_score,
+        liquidity=float(scores["liquidity"].score), orderbook=float(scores["orderbook"].score),
+        net_profit_feasibility=float(risk.net_profit_feasibility_score),
+        risk_feasibility=float(risk.risk_plan_score), data_quality=data_quality,
+        estimated_tp_probability=_safe_float(normalized.get("estimated_tp_probability")),
+    )
+    if mode == "bpjs_live":
+        final_score = ranking.ranking_score
+    else:
+        confidence_multiplier = 0.70 + (0.30 * coverage / 100.0)
+        final_score = round(calculate_final_score(scores, risk, mode, config) * confidence_multiplier, 2)
+    if strategy.status_cap == WatchlistStatus.READY_SOON and status == WatchlistStatus.EXECUTION_READY:
+        status = WatchlistStatus.READY_SOON
+    elif strategy.status_cap == WatchlistStatus.WATCHLIST and status in {
+        WatchlistStatus.EXECUTION_READY, WatchlistStatus.EXECUTION_CANDIDATE,
+        WatchlistStatus.EXECUTION_DRAFT, WatchlistStatus.READY_SOON,
+    }:
+        status = WatchlistStatus.EARLY_WATCH
+    funnel_status = to_funnel_status(status)
     best_bid = _safe_float(normalized.get("best_bid"))
     best_offer = _safe_float(normalized.get("best_offer"))
     spread_ticks = _safe_float(normalized.get("spread_ticks"))
@@ -820,20 +909,49 @@ def build_output_row(
     ratio = _safe_float(normalized.get("bid_offer_ratio_5"))
     if ratio is None and bid_depth is not None and offer_depth not in {None, 0}:
         ratio = bid_depth / offer_depth
+    explanation = build_explanation(status, scores, risk, flow_source, warnings, skip_reasons)
+    decision_timestamp = normalized.get("decision_timestamp", normalized.get("date"))
+    data_cutoff_timestamp = normalized.get("data_cutoff_timestamp", decision_timestamp)
     output = {
         "symbol": normalized.get("symbol"),
         "name": normalized.get("name"),
         "date": normalized.get("date"),
         "mode": mode,
+        "decision_timestamp": decision_timestamp,
+        "data_cutoff_timestamp": data_cutoff_timestamp,
+        "feature_version": normalized.get("feature_version", "technical-prior-v1"),
+        "strategy_version": normalized.get("strategy_version", "hybrid-p2-v1"),
+        "config_hash": normalized.get("config_hash", hybrid_config_hash(config)),
+        "code_commit_hash": normalized.get("code_commit_hash", "UNKNOWN"),
+        "universe_version": normalized.get("universe_version", "UNKNOWN"),
+        "raw_input_refs": normalized.get("raw_input_refs", ""),
+        "broker_snapshot_timestamp": normalized.get("broker_snapshot_timestamp"),
+        "orderbook_snapshot_timestamp": normalized.get("orderbook_snapshot_timestamp"),
         "final_status": status,
+        "funnel_status": funnel_status,
+        "is_primary_candidate": False,
+        "daily_decision": WatchlistStatus.NO_TRADE,
         "final_score": final_score,
+        "ranking_score": ranking.ranking_score,
+        "alpha_score": ranking.alpha_score,
+        "execution_quality_score": ranking.execution_quality_score,
+        "risk_feasibility_score": ranking.risk_feasibility_score,
+        "confidence_score": ranking.confidence_score,
         "rank": None,
         "flow_source": flow_source,
+        "strategy_name": strategy.definition.name,
+        "strategy_eligible": strategy.eligible,
+        "entry_trigger_touched": strategy.trigger_touched,
+        "strategy_status_cap": strategy.status_cap,
+        "strategy_reasons": ";".join(strategy.reasons),
+        "estimated_tp_probability": normalized.get("estimated_tp_probability"),
         "liquidity_score": round(float(scores["liquidity"].score), 2),
         "technical_score": round(float(scores["technical"].score), 2),
         "smart_money_score": round(float(scores["smart_money"].score), 2),
         "price_extension_score": round(float(scores["price_extension"].score), 2),
         "market_regime_score": round(float(scores["market_regime"].score), 2),
+        "ihsg_trend_regime": normalized.get("ihsg_trend_regime", normalized.get("market_regime")),
+        "market_regime_source": normalized.get("market_regime_source", "IHSG_TREND_FALLBACK"),
         "sector_strength_score": round(float(scores["sector_strength"].score), 2),
         "orderbook_score": round(float(scores["orderbook"].score), 2),
         "risk_plan_score": round(float(risk.risk_plan_score), 2),
@@ -876,9 +994,15 @@ def build_output_row(
         "frequency_live": _safe_float(_first(normalized, ["frequency_live", "frequency"])),
         "value_live": _safe_float(_first(normalized, ["value_live", "value"])),
         "entry_price": risk.entry_price,
+        "planned_entry": risk.entry_price,
+        "actual_entry": normalized.get("actual_entry"),
         "tp1_price": risk.tp1_price,
         "tp2_price": risk.tp2_price,
         "stop_loss_price": risk.stop_loss_price,
+        "planned_stop": risk.stop_loss_price,
+        "actual_stop": normalized.get("actual_stop"),
+        "planned_target": risk.tp1_price,
+        "actual_lots": normalized.get("actual_lots", 0),
         "target_tp_pct": risk.target_tp_pct,
         "stop_loss_pct": risk.stop_loss_pct,
         "estimated_buy_fee": risk.estimated_buy_fee,
@@ -886,15 +1010,39 @@ def build_output_row(
         "estimated_slippage": risk.estimated_slippage,
         "gross_profit": risk.gross_profit,
         "net_profit_after_fee": risk.net_profit_after_fee,
+        "expected_net_return_pct": risk.expected_net_return_pct,
+        "net_risk_reward_ratio": risk.net_risk_reward_ratio,
         "risk_amount": risk.risk_amount,
         "reward_amount": risk.reward_amount,
         "risk_reward_ratio": risk.risk_reward_ratio,
         "affordable_lot": risk.affordable_lot,
         "position_value": risk.position_value,
+        "risk_budget_amount": risk.risk_budget_amount,
+        "risk_based_limit": risk.risk_based_limit,
+        "capital_based_limit": risk.capital_based_limit,
+        "liquidity_based_limit": risk.liquidity_based_limit,
+        "available_cash_limit": risk.available_cash_limit,
+        "binding_constraint": risk.binding_constraint,
+        "planned_lots": risk.lot,
+        "actual_position_value": risk.position_value,
+        "actual_cash_required": risk.actual_cash_required,
+        "actual_risk_amount": risk.risk_amount,
+        "actual_risk_pct": risk.actual_risk_pct,
+        "capital_utilization_pct": risk.capital_utilization_pct,
+        "liquidity_participation_pct": risk.liquidity_participation_pct,
+        "estimated_transaction_cost": risk.estimated_transaction_cost,
+        "rejection_reason": risk.rejection_reason,
+        "signal_reason": explanation,
+        "status_transition": f"DISCOVERED->{status.value}",
+        "score_coverage_pct": round(coverage, 2),
+        "missing_required_features": ";".join(missing_required),
+        "missing_optional_features": ";".join(missing_optional),
+        "data_quality_score": round(data_quality, 2),
+        "confidence_level": confidence,
         "capital_profile": capital_profile,
         "warnings": ";".join(warnings),
         "skip_reasons": ";".join(skip_reasons),
-        "explanation": build_explanation(status, scores, risk, flow_source, warnings, skip_reasons),
+        "explanation": explanation,
     }
     for window in [1, 3, 5, 10, 20]:
         output[f"broker_net_buy_{window}d"] = normalized.get(f"broker_net_buy_{window}d")
@@ -967,6 +1115,10 @@ def build_hybrid_watchlist(
     # 2. Preload Ticker Histories & Blackout Events for fast processing
     ticker_histories = {}
     blackout_events = {}
+    corporate_action_store = None
+    corporate_action_path = Path(config.corporate_action_db)
+    if corporate_action_path.exists():
+        corporate_action_store = CorporateActionStore(db_path=corporate_action_path)
     cache = MarketDataCache(db_path)
     from .technical import calculate_technical_features
 
@@ -981,7 +1133,9 @@ def build_hybrid_watchlist(
             if not df.empty:
                 features = calculate_technical_features(df)
                 ticker_histories[ticker] = features
-                blackout_events[ticker] = detect_corporate_action_dates(df)
+                # Do not infer historical knowledge from adjusted/raw ratios.
+                # Blackout events must come from an announcement-timestamped
+                # CorporateActionStore query performed as-of the decision time.
         except Exception as e:
             print(f"Warning: Failed preloading cache for {ticker}: {e}")
 
@@ -995,6 +1149,8 @@ def build_hybrid_watchlist(
             row_dict = row.to_dict()
             row_dict["market_regime"] = regime
             row_dict["market_regime_score"] = regime_score
+            row_dict["ihsg_trend_regime"] = regime
+            row_dict["market_regime_source"] = "IHSG_TREND_FALLBACK"
 
             output = build_output_row(
                 row_dict,
@@ -1003,6 +1159,7 @@ def build_hybrid_watchlist(
                 config,
                 ticker_history=history,
                 blackout_events=blackout_events,
+                corporate_action_store=corporate_action_store,
             )
             if date:
                 output["date"] = date
@@ -1040,6 +1197,23 @@ def build_hybrid_watchlist(
     output_df["_status_rank"] = output_df["final_status"].map(status_rank).fillna(99)
     output_df = output_df.sort_values(["_status_rank", "final_score"], ascending=[True, False], na_position="last")
     output_df["rank"] = range(1, len(output_df) + 1)
+    if mode == "bpjs_live":
+        caps = {
+            WatchlistStatus.WATCHLIST.value: config.watchlist.max_watchlist,
+            WatchlistStatus.READY_SOON.value: config.watchlist.max_ready_soon,
+            WatchlistStatus.EXECUTION_READY.value: config.watchlist.max_execution_ready,
+        }
+        keep_indices: list[int] = []
+        for funnel, group in output_df.groupby("funnel_status", sort=False):
+            cap = caps.get(str(funnel), len(group))
+            keep_indices.extend(group.head(cap).index.tolist())
+        output_df = output_df.loc[output_df.index.isin(keep_indices)].copy()
+        execution_ready = output_df[output_df["funnel_status"] == WatchlistStatus.EXECUTION_READY]
+        if not execution_ready.empty:
+            output_df["daily_decision"] = WatchlistStatus.EXECUTION_READY
+            output_df.loc[execution_ready.index[0], "is_primary_candidate"] = True
+        else:
+            output_df["daily_decision"] = WatchlistStatus.NO_TRADE
     if max_candidates is None:
         max_candidates = config.watchlist.max_candidates_bpjs if mode == "bpjs_live" else config.watchlist.max_candidates_default
     limited = output_df.head(max_candidates).copy() if max_candidates and max_candidates > 0 else output_df
@@ -1116,8 +1290,10 @@ def run_hybrid_screener(
         tp_mode = "adaptive" if enable_adaptive_tp else "fixed"
         config = replace(config, adaptive_tp=replace(config.adaptive_tp, mode=tp_mode))
     if enable_liquidity_sizer is not None:
-        max_pct = 0.10 if enable_liquidity_sizer else 0.0
-        config = replace(config, liquidity_sizer=replace(config.liquidity_sizer, max_pct_of_avg_value_20d=max_pct))
+        config = replace(
+            config,
+            liquidity_sizer=replace(config.liquidity_sizer, enabled=enable_liquidity_sizer),
+        )
     if enable_blackout is not None:
         config = replace(config, blackout=replace(config.blackout, enabled=enable_blackout))
 

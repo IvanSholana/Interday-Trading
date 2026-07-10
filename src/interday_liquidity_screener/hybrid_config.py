@@ -4,7 +4,9 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
 import json
+import hashlib
 
+from .bpjs_config import DEFAULT_BPJS_PROFILE
 from .enhancements import (
     AdaptiveTPConfig,
     BlackoutConfig,
@@ -49,15 +51,41 @@ OUTPUT_COLUMNS = [
     "name",
     "date",
     "mode",
+    "decision_timestamp",
+    "data_cutoff_timestamp",
+    "feature_version",
+    "strategy_version",
+    "config_hash",
+    "code_commit_hash",
+    "universe_version",
+    "raw_input_refs",
+    "broker_snapshot_timestamp",
+    "orderbook_snapshot_timestamp",
     "final_status",
+    "funnel_status",
+    "is_primary_candidate",
+    "daily_decision",
     "final_score",
+    "ranking_score",
+    "alpha_score",
+    "execution_quality_score",
+    "risk_feasibility_score",
+    "confidence_score",
     "rank",
     "flow_source",
+    "strategy_name",
+    "strategy_eligible",
+    "entry_trigger_touched",
+    "strategy_status_cap",
+    "strategy_reasons",
+    "estimated_tp_probability",
     "liquidity_score",
     "technical_score",
     "smart_money_score",
     "price_extension_score",
     "market_regime_score",
+    "ihsg_trend_regime",
+    "market_regime_source",
     "sector_strength_score",
     "orderbook_score",
     "risk_plan_score",
@@ -105,9 +133,15 @@ OUTPUT_COLUMNS = [
     "frequency_live",
     "value_live",
     "entry_price",
+    "planned_entry",
+    "actual_entry",
     "tp1_price",
     "tp2_price",
     "stop_loss_price",
+    "planned_stop",
+    "actual_stop",
+    "planned_target",
+    "actual_lots",
     "target_tp_pct",
     "stop_loss_pct",
     "estimated_buy_fee",
@@ -115,11 +149,35 @@ OUTPUT_COLUMNS = [
     "estimated_slippage",
     "gross_profit",
     "net_profit_after_fee",
+    "expected_net_return_pct",
+    "net_risk_reward_ratio",
     "risk_amount",
     "reward_amount",
     "risk_reward_ratio",
     "affordable_lot",
     "position_value",
+    "risk_budget_amount",
+    "risk_based_limit",
+    "capital_based_limit",
+    "liquidity_based_limit",
+    "available_cash_limit",
+    "binding_constraint",
+    "planned_lots",
+    "actual_position_value",
+    "actual_cash_required",
+    "actual_risk_amount",
+    "actual_risk_pct",
+    "capital_utilization_pct",
+    "liquidity_participation_pct",
+    "estimated_transaction_cost",
+    "rejection_reason",
+    "signal_reason",
+    "status_transition",
+    "score_coverage_pct",
+    "missing_required_features",
+    "missing_optional_features",
+    "data_quality_score",
+    "confidence_level",
     "capital_profile",
     "warnings",
     "skip_reasons",
@@ -141,12 +199,14 @@ class CapitalProfile:
 
 @dataclass(frozen=True)
 class FeesConfig:
-    buy_fee_pct: float = 0.0015
-    sell_fee_pct: float = 0.0025
+    buy_fee_pct: float = DEFAULT_BPJS_PROFILE.buy_fee_pct
+    sell_fee_pct: float = DEFAULT_BPJS_PROFILE.sell_fee_pct
+    sell_tax_pct: float = DEFAULT_BPJS_PROFILE.sell_tax_pct
     round_trip_fee_pct_fallback: float = 0.0045
     minimum_buy_fee: float = 0.0
     minimum_sell_fee: float = 0.0
-    slippage_pct_default: float = 0.001
+    estimated_spread_pct_default: float = DEFAULT_BPJS_PROFILE.estimated_spread_pct
+    slippage_pct_default: float = DEFAULT_BPJS_PROFILE.estimated_slippage_pct
 
 
 @dataclass(frozen=True)
@@ -208,16 +268,21 @@ class OrderbookConfig:
 
 @dataclass(frozen=True)
 class WatchlistConfig:
-    max_candidates_bpjs: int = 5
+    max_candidates_bpjs: int = 10
     max_candidates_default: int = 10
+    max_watchlist: int = 10
+    max_ready_soon: int = 3
+    max_execution_ready: int = 2
 
 
 @dataclass(frozen=True)
 class RiskConfig:
     minimum_net_profit: float = 5_000
     minimum_risk_reward: float = 1.2
-    lot_size: int = 100
-    risk_per_trade_pct: float = 0.005
+    lot_size: int = DEFAULT_BPJS_PROFILE.lot_size
+    risk_per_trade_pct: float = DEFAULT_BPJS_PROFILE.risk_per_trade_pct
+    max_risk_per_trade_pct: float = DEFAULT_BPJS_PROFILE.max_risk_per_trade_pct
+    hard_max_loss_pct: float = DEFAULT_BPJS_PROFILE.hard_max_loss_pct
 
 
 @dataclass(frozen=True)
@@ -234,8 +299,9 @@ class SafetyConfig:
 class HybridScreenerConfig:
     capital_profiles: dict[str, CapitalProfile] = field(
         default_factory=lambda: {
-            "capital_500k": CapitalProfile(500_000, 1.0, 5_000, 50, 500, 0.015, 0.02, 0.01),
-            "capital_1m": CapitalProfile(1_000_000, 1.0, 10_000, 50, 1_000, 0.015, 0.02, 0.01),
+            "capital_100k": CapitalProfile(100_000, DEFAULT_BPJS_PROFILE.max_position_pct, 1_000, 50, 200, 0.015, DEFAULT_BPJS_PROFILE.target_tp1_pct, DEFAULT_BPJS_PROFILE.default_stop_loss_pct),
+            "capital_500k": CapitalProfile(500_000, DEFAULT_BPJS_PROFILE.max_position_pct, 5_000, 50, 500, 0.015, DEFAULT_BPJS_PROFILE.target_tp1_pct, DEFAULT_BPJS_PROFILE.default_stop_loss_pct),
+            "capital_1m": CapitalProfile(1_000_000, DEFAULT_BPJS_PROFILE.max_position_pct, 10_000, 50, 1_000, 0.015, DEFAULT_BPJS_PROFILE.target_tp1_pct, DEFAULT_BPJS_PROFILE.default_stop_loss_pct),
             "capital_1_5m": CapitalProfile(1_500_000, 1.0, 15_000, 50, 1_500, 0.015, 0.02, 0.01),
         }
     )
@@ -257,6 +323,7 @@ class HybridScreenerConfig:
     liquidity_sizer: LiquiditySizerConfig = field(default_factory=LiquiditySizerConfig)
     broker_window: BrokerWindowConfig = field(default_factory=BrokerWindowConfig)
     market_data_db: Path = DEFAULT_MARKET_DATA_DB
+    corporate_action_db: Path = Path("data/cache/corporate_actions.sqlite")
     weights: dict[str, dict[str, float]] = field(
         default_factory=lambda: {
             "bpjs_live": {
@@ -340,6 +407,20 @@ class RiskPlan:
     net_profit_feasibility_score: float
     warnings: tuple[str, ...] = ()
     skip_reasons: tuple[str, ...] = ()
+    expected_net_return_pct: float = 0.0
+    net_risk_reward_ratio: float = 0.0
+    risk_budget_amount: float = 0.0
+    risk_based_limit: float = 0.0
+    capital_based_limit: float = 0.0
+    liquidity_based_limit: float = 0.0
+    available_cash_limit: float = 0.0
+    binding_constraint: str = ""
+    actual_cash_required: float = 0.0
+    actual_risk_pct: float = 0.0
+    capital_utilization_pct: float = 0.0
+    liquidity_participation_pct: float = 0.0
+    estimated_transaction_cost: float = 0.0
+    rejection_reason: str | None = None
 
 
 def _as_plain(value: Any) -> Any:
@@ -445,6 +526,7 @@ def config_from_dict(data: dict[str, Any]) -> HybridScreenerConfig:
         liquidity_sizer=_dataclass_from_dict(LiquiditySizerConfig, merged.get("liquidity_sizer", {})),
         broker_window=_dataclass_from_dict(BrokerWindowConfig, merged.get("broker_window", {})),
         market_data_db=Path(merged.get("market_data_db", DEFAULT_MARKET_DATA_DB)),
+        corporate_action_db=Path(merged.get("corporate_action_db", "data/cache/corporate_actions.sqlite")),
         weights=merged.get("weights", {}),
     )
 
@@ -460,3 +542,8 @@ def load_hybrid_config(path: str | Path | None = None) -> HybridScreenerConfig:
     else:
         data = _simple_yaml_load(config_path)
     return config_from_dict(data)
+
+
+def hybrid_config_hash(config: HybridScreenerConfig) -> str:
+    payload = json.dumps(_as_plain(config), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
