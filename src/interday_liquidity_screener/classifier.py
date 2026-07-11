@@ -76,6 +76,9 @@ def _check_daily_gates(row: dict[str, Any], config: ScreenerConfig) -> list[str]
     """Check daily activity gates that determine trade candidacy but not absolute liquidity.
 
     Returns a list of gate failure reasons, or empty list if all gates pass.
+
+    When config.enable_adaptive_threshold is True, min_volume_ratio is adjusted
+    per day-of-week from historical data (if available in row as '_adaptive_min_volume_ratio').
     """
     failures: list[str] = []
 
@@ -84,7 +87,14 @@ def _check_daily_gates(row: dict[str, Any], config: ScreenerConfig) -> list[str]
         failures.append("latest_value_below_min_value")
 
     volume_ratio = row.get("volume_ratio")
-    if volume_ratio is not None and volume_ratio < config.min_volume_ratio:
+    # Use adaptive threshold if available, else fall back to static config
+    effective_min_volume_ratio = config.min_volume_ratio
+    if config.enable_adaptive_threshold:
+        adaptive = row.get("_adaptive_min_volume_ratio")
+        if adaptive is not None:
+            effective_min_volume_ratio = float(adaptive)
+
+    if volume_ratio is not None and volume_ratio < effective_min_volume_ratio:
         failures.append("volume_ratio_below_min_volume_ratio")
 
     return_5d = row.get("return_5d")

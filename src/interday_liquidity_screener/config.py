@@ -20,3 +20,9 @@ class ScreenerConfig:
     sleep: float = 0.0
     market_data_db: str = str(DEFAULT_MARKET_DATA_DB)
     refresh_market_data: bool = False
+    # P6 Adaptive Threshold: when enabled, min_volume_ratio is adjusted per
+    # day-of-week based on historical distribution. The static value above
+    # becomes a fallback when history is insufficient.
+    enable_adaptive_threshold: bool = False
+    adaptive_threshold_percentile: float = 30.0
+    adaptive_threshold_floor: float = 0.3

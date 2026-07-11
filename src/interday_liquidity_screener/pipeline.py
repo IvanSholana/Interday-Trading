@@ -237,6 +237,10 @@ class PipelineOptions:
     enable_adaptive_tp: bool | None = None
     enable_liquidity_sizer: bool | None = None
     enable_blackout: bool | None = None
+    enable_adaptive_threshold: bool = True  # P6: day-of-week volume threshold
+    enable_sr_take_profit: bool = True  # P7: S/R-based TP (always on via trade_plan.py)
+    enable_trailing_stop: bool = True  # P8: trailing stop + time-decay (always on via backtest)
+    enable_sector_guard: bool = True  # P9: sector diversification (always on via hybrid)
 
 
 def create_run_id(now: datetime | None = None) -> str:
@@ -434,7 +438,10 @@ def capture_stage(name: str, output_path: Path | None, func: Callable[[], Any], 
             func()
         return StageRunResult(name=name, ok=True, log=buffer.getvalue(), output_path=output_path)
     except Exception as exc:
-        return StageRunResult(name=name, ok=False, log=buffer.getvalue(), output_path=output_path, error=str(exc))
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        error_detail = f"{type(exc).__name__}: {exc}\n{tb_str}"
+        return StageRunResult(name=name, ok=False, log=buffer.getvalue(), output_path=output_path, error=error_detail)
 
 
 def is_morning_live_refresh(stage_names: list[str], resume: bool) -> bool:
@@ -457,17 +464,64 @@ def is_morning_live_refresh(stage_names: list[str], resume: bool) -> bool:
 
 
 def run_stage1_screening(tickers_file: str | Path, output_path: str | Path, options: PipelineOptions) -> pd.DataFrame:
+    # Prefetch with the longest period needed by any downstream stage (Stage 2
+    # uses period_stage2 which is typically "1y"). This prevents a redundant
+    # second full fetch when the data source is sequential (Stockbit).
+    fetch_period = max(
+        options.period_stage1,
+        options.period_stage2,
+        key=lambda p: {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "max": 999}.get(p, 90),
+    )
     config = ScreenerConfig(
-        period=options.period_stage1,
+        period=fetch_period,
         interval="1d",
         batch_size=50,
         market_data_db=str(options.market_data_db),
         refresh_market_data=options.refresh_market_data,
+        enable_adaptive_threshold=options.enable_adaptive_threshold,
     )
     tickers = load_tickers(tickers_file)
     print(f"Total tickers loaded: {len(tickers)}")
     data_map = download_ticker_data(tickers, config)
+
+    # P6: Compute adaptive threshold if enabled
+    adaptive_min_vol_ratio: float | None = None
+    if config.enable_adaptive_threshold:
+        from .enhancements.adaptive_threshold import AdaptiveThreshold
+        from .market_data_cache import MarketDataCache
+        at = AdaptiveThreshold(
+            enabled=True,
+            volume_ratio_percentile=config.adaptive_threshold_percentile,
+            min_volume_ratio_floor=config.adaptive_threshold_floor,
+        )
+        # Use IHSG or first available ticker's history to compute day-of-week pattern
+        cache = MarketDataCache(config.market_data_db)
+        ihsg_df = cache.load_ohlcv("^JKSE", "1d")
+        if ihsg_df.empty:
+            # Fallback: use first ticker data
+            for t in tickers[:3]:
+                sample_df = data_map.get(t, None)
+                if sample_df is not None and not sample_df.empty:
+                    ihsg_df = sample_df
+                    break
+        if not ihsg_df.empty:
+            from .technical import calculate_technical_features
+            try:
+                features = calculate_technical_features(ihsg_df)
+                if "volume_ratio" in features.columns:
+                    run_dt = pd.Timestamp(options.run_date).date() if options.run_date else None
+                    adaptive_min_vol_ratio = at.get_adjusted_min_volume_ratio(features, run_dt, default=config.min_volume_ratio)
+                    print(f"P6 Adaptive threshold: min_volume_ratio={adaptive_min_vol_ratio:.2f} (static={config.min_volume_ratio})")
+            except Exception:
+                pass  # Non-critical — fall back to static
+
     rows = [compute_metrics(ticker, data_map.get(ticker), config) for ticker in tickers]
+
+    # Inject adaptive threshold into rows for classifier
+    if adaptive_min_vol_ratio is not None:
+        for row in rows:
+            row["_adaptive_min_volume_ratio"] = adaptive_min_vol_ratio
+
     output = build_result_frame(rows)
     save_csv(output, output_path)
     print(f"Stage 1 output saved to: {output_path}")

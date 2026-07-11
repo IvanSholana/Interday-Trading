@@ -202,6 +202,31 @@ def get_stockbit_token() -> str:
     return token
 
 
+def validate_stockbit_token(token: str | None = None) -> tuple[bool, str]:
+    """Test if the current Stockbit token is valid by making a lightweight API call.
+
+    Returns (is_valid, message).
+    """
+    token = token or os.environ.get("STOCKBIT_TOKEN", "").strip()
+    if not token:
+        return False, "STOCKBIT_TOKEN is empty"
+    try:
+        url = "https://exodus.stockbit.com/user-setting/configurations"
+        request = Request(url, headers=_headers(token), method="GET")
+        with urlopen(request, timeout=10) as response:
+            if response.status == 200:
+                return True, "Token valid"
+    except HTTPError as exc:
+        if exc.code == 401:
+            return False, "Token expired/invalid (401). Login to Stockbit and refresh token."
+        if exc.code == 403:
+            return False, "Token forbidden (403). Account may be restricted."
+        return False, f"HTTP error {exc.code}"
+    except Exception as exc:
+        return False, f"Connection error: {exc}"
+    return False, "Unknown error"
+
+
 def load_stage2_bandar_watchlist(input_path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(input_path)
     required = {"ticker", "bandar_watch_eligible"}

@@ -899,6 +899,17 @@ def build_output_row(
     else:
         confidence_multiplier = 0.70 + (0.30 * coverage / 100.0)
         final_score = round(calculate_final_score(scores, risk, mode, config) * confidence_multiplier, 2)
+
+    # P11 Insider activity score adjustment
+    insider_adj = normalized.get("_insider_score_adjustment", 0)
+    if insider_adj:
+        final_score = round(final_score + float(insider_adj), 2)
+
+    # P12 Ex-date blackout: force SKIP if ticker is on/near ex-date
+    if normalized.get("_exdate_blocked"):
+        status = WatchlistStatus.SKIP
+        final_score = max(0, final_score - 30)
+
     if strategy.status_cap == WatchlistStatus.READY_SOON and status == WatchlistStatus.EXECUTION_READY:
         status = WatchlistStatus.READY_SOON
     elif strategy.status_cap == WatchlistStatus.WATCHLIST and status in {
@@ -1108,6 +1119,43 @@ def build_hybrid_watchlist(
     decision_date = pd.Timestamp(date) if date else None
     db_path = config.market_data_db or DEFAULT_MARKET_DATA_DB
 
+    # P11 Insider activity: fetch once per run, inject adjustments into candidates
+    insider_activity: dict[str, Any] = {}
+    try:
+        from .insider_tracker import fetch_insider_transactions, analyze_insider_activity
+        insider_txs = fetch_insider_transactions(limit=50, use_cache=True)
+        if insider_txs:
+            insider_activity = analyze_insider_activity(insider_txs, lookback_days=7)
+            # Inject _insider_score_adjustment into candidate rows
+            if "symbol" in candidates.columns or "ticker" in candidates.columns:
+                tkr_col = "symbol" if "symbol" in candidates.columns else "ticker"
+                candidates = candidates.copy()
+                candidates["_insider_score_adjustment"] = candidates[tkr_col].apply(
+                    lambda t: insider_activity.get(str(t).replace(".JK", "").upper(), {}).get("score_adjustment", 0)
+                )
+    except Exception:
+        pass  # Non-critical — insider data is a boost, not a gate
+
+    # P12 Dividend ex-date blackout: block tickers on/near ex-date
+    exdate_blocked_tickers: set[str] = set()
+    try:
+        from .dividend_tracker import fetch_upcoming_dividends, get_exdate_tickers
+        from datetime import date as _date_type
+        dividend_events = fetch_upcoming_dividends(use_cache=True)
+        today_date = _date_type.today()
+        # Block tickers whose ex-date is today or tomorrow
+        exdate_blocked_tickers = set(get_exdate_tickers(dividend_events, today_date))
+        tomorrow = today_date + timedelta(days=1)
+        exdate_blocked_tickers.update(get_exdate_tickers(dividend_events, tomorrow))
+        if exdate_blocked_tickers:
+            if "symbol" in candidates.columns or "ticker" in candidates.columns:
+                tkr_col = "symbol" if "symbol" in candidates.columns else "ticker"
+                candidates["_exdate_blocked"] = candidates[tkr_col].apply(
+                    lambda t: str(t).replace(".JK", "").upper() in exdate_blocked_tickers
+                )
+    except Exception:
+        pass  # Non-critical
+
     # 1. Evaluate Market Regime once per run
     regime = "RISK_ON"
     regime_score = 50.0
@@ -1227,6 +1275,30 @@ def build_hybrid_watchlist(
             output_df["daily_decision"] = WatchlistStatus.NO_TRADE
     if max_candidates is None:
         max_candidates = config.watchlist.max_candidates_bpjs if mode == "bpjs_live" else config.watchlist.max_candidates_default
+
+    # P9 Sector diversification guard: iteratively demote over-concentrated sectors
+    from .enhancements.sector_correlation import SectorCorrelationGuard, prefetch_sectors
+    sector_guard = SectorCorrelationGuard(enabled=True)
+    if not output_df.empty and "symbol" in output_df.columns:
+        # Prefetch sectors for all candidates ONCE before iterative loop
+        all_symbols = output_df["symbol"].tolist()
+        prefetch_sectors(all_symbols)
+
+        # Iterate up to 3 times to ensure diversification converges
+        for _pass in range(3):
+            top_symbols = output_df["symbol"].tolist()[:max_candidates * 2] if max_candidates else output_df["symbol"].tolist()
+            sector_result = sector_guard.sector_check(top_symbols)
+            if sector_result["diversified"]:
+                break
+            # Demote excess tickers from over-represented sectors
+            for violation in sector_result["violations"]:
+                for remove_ticker in violation.get("remove_suggestion", []):
+                    mask = output_df["symbol"] == remove_ticker
+                    if mask.any():
+                        output_df.loc[mask, "final_score"] = output_df.loc[mask, "final_score"] - 5.0
+            # Re-sort after demotion
+            output_df = output_df.sort_values("final_score", ascending=False).copy()
+
     limited = output_df.head(max_candidates).copy() if max_candidates and max_candidates > 0 else output_df
     return limited[OUTPUT_COLUMNS]
 

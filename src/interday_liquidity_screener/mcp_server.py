@@ -307,6 +307,86 @@ MCP_CAPABILITIES = [
         safety_note="Reads existing monitor output only; it does not start or alter the monitor.",
     ),
     McpToolCapability(
+        name="diagnose_run",
+        category="decision_support",
+        mutation_level="read_only",
+        when_to_use="Call IMMEDIATELY after a run with 0 valid plans to understand why. Returns stage-by-stage rejection funnel in one call.",
+        output_formats=["json", "markdown"],
+        safety_note="Reads existing run artifacts only. Saves 4+ round-trips of inspection tools.",
+    ),
+    McpToolCapability(
+        name="suggest_next_action",
+        category="decision_support",
+        mutation_level="read_only",
+        when_to_use="Call after diagnose_run to get actionable recommendations: retry timing, parameter changes, or alternative approaches.",
+        output_formats=["json", "markdown"],
+        safety_note="Advisory only; does not execute any action automatically.",
+    ),
+    McpToolCapability(
+        name="what_if",
+        category="decision_support",
+        mutation_level="read_only",
+        when_to_use="Simulate capital/risk parameter changes against an existing run WITHOUT re-running. Instantly shows how many tickers become affordable.",
+        output_formats=["json", "markdown"],
+        safety_note="Pure calculation on cached data. Does not fetch, mutate, or create new runs.",
+    ),
+    McpToolCapability(
+        name="compare_runs",
+        category="inspection",
+        mutation_level="read_only",
+        when_to_use="Compare two runs to identify improvement or regression after parameter or enhancement changes.",
+        output_formats=["json", "markdown"],
+        safety_note="Reads existing run directories only.",
+    ),
+    McpToolCapability(
+        name="get_insider_activity",
+        category="market_data",
+        mutation_level="read_only",
+        when_to_use="Check recent insider buying/selling (directors, commissioners) for confirmation or danger signals. Insider multiple-buy = strongest accumulation signal.",
+        output_formats=["json", "markdown"],
+        safety_note="Fetches from Stockbit stream (1 request, cached daily). Insider data is public IDX disclosure.",
+    ),
+    McpToolCapability(
+        name="get_dividend_calendar",
+        category="market_data",
+        mutation_level="read_only",
+        when_to_use="Check upcoming cum-dates and ex-dates. BLOCK trades on ex-date (price drops). Identify cum-date dividend plays.",
+        output_formats=["json", "markdown"],
+        safety_note="Fetches from Stockbit (1 request, cached daily). Always check before recommending a buy.",
+    ),
+    McpToolCapability(
+        name="validate_token",
+        category="preflight",
+        mutation_level="read_only",
+        when_to_use="Call FIRST when getting 401 errors from Stockbit tools. Tests if the token is still valid and provides fix instructions if not.",
+        output_formats=["json", "markdown"],
+        safety_note="Makes 1 lightweight API call. Does not modify token or any state.",
+    ),
+    McpToolCapability(
+        name="refresh_market_data_stockbit",
+        category="market_data",
+        mutation_level="writes_cache_artifacts",
+        when_to_use="Fetch/update daily OHLCV + foreign flow from Stockbit for a universe. Run before pipeline scans to ensure fresh data.",
+        output_formats=["markdown", "json"],
+        safety_note="Makes sequential HTTP requests to Stockbit with human-like pacing. Writes to local sqlite cache only.",
+    ),
+    McpToolCapability(
+        name="get_intraday_analysis",
+        category="market_data",
+        mutation_level="read_only",
+        when_to_use="Get intraday VWAP, opening gap, and volume profile for a ticker. Use in Fase Pagi for entry timing.",
+        output_formats=["markdown", "json"],
+        safety_note="Fetches 1-min candles from Stockbit (1-2 requests). Only available for last ~7 trading days.",
+    ),
+    McpToolCapability(
+        name="get_foreign_flow",
+        category="market_data",
+        mutation_level="read_only",
+        when_to_use="Check net foreign buy/sell flow for tickers to confirm institutional interest before entry.",
+        output_formats=["markdown", "json"],
+        safety_note="Fetches daily data from Stockbit (1 request per ticker, max 5). Human-like pacing applied.",
+    ),
+    McpToolCapability(
         name="get_ticker_stage_details",
         category="inspection",
         mutation_level="read_only",
@@ -501,6 +581,11 @@ def _system_health_payload() -> dict[str, object]:
         "env": {
             "stockbit_token_available": bool(os.getenv("STOCKBIT_TOKEN")),
             "deepseek_api_key_available": bool(os.getenv("DEEPSEEK_API_KEY")),
+            "data_source": "stockbit" if bool(os.getenv("STOCKBIT_TOKEN")) else "yfinance_fallback",
+            "data_source_warning": (
+                None if bool(os.getenv("STOCKBIT_TOKEN"))
+                else "Stockbit token missing — pipeline will use yfinance (delayed IDX data). Set STOCKBIT_TOKEN in .env."
+            ),
         },
         "next_action": (
             "Create or repair required local folders/files before running the pipeline."
@@ -2078,6 +2163,759 @@ def get_ticker_stage_details(
 
 
 @mcp.tool()
+def refresh_market_data_stockbit(
+    universe_key: str = "lq45",
+    days: int = 365,
+    output_format: str = "markdown",
+) -> str:
+    """Fetch/update daily OHLCV + foreign flow data from Stockbit for a universe.
+
+    Uses human-like request pacing (3-8s random delays) and caches results in
+    the market data sqlite DB. Run this before a pipeline scan to ensure fresh
+    data from Stockbit (more accurate than yfinance for IDX).
+
+    Args:
+        universe_key: Ticker universe preset key (e.g. 'lq45', 'idx80').
+        days: Number of calendar days of history to fetch per ticker.
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    from interday_liquidity_screener.stockbit_market_data import (
+        fetch_daily_ohlcv_batch_stockbit,
+        daily_bars_to_dataframe,
+        reset_session,
+        StockbitFetchConfig,
+    )
+    from interday_liquidity_screener.ticker_universe import load_universe_tickers
+    from interday_liquidity_screener.market_data_cache import MarketDataCache
+
+    tickers_raw = load_universe_tickers(universe_key)
+    # Strip .JK suffix for Stockbit API
+    tickers = [t.replace(".JK", "") for t in tickers_raw]
+    if not tickers:
+        return f"Error: Universe '{universe_key}' has no tickers."
+
+    reset_session()
+    config = StockbitFetchConfig(max_requests_per_session=len(tickers) + 5)
+
+    try:
+        results = fetch_daily_ohlcv_batch_stockbit(tickers, days=days, config=config)
+    except Exception as e:
+        logger.exception("Failed to fetch Stockbit daily data")
+        return f"Error fetching Stockbit data: {e}"
+
+    # Save to sqlite cache (same DB as yfinance)
+    cache = MarketDataCache(DEFAULT_MARKET_DATA_DB)
+    saved_count = 0
+    for ticker, bars in results.items():
+        if not bars:
+            continue
+        df = daily_bars_to_dataframe(bars)
+        if not df.empty:
+            yahoo_ticker = f"{ticker}.JK"
+            cache.save_ohlcv(yahoo_ticker, df, "1d")
+            saved_count += 1
+
+    summary = {
+        "universe_key": universe_key,
+        "tickers_requested": len(tickers),
+        "tickers_saved": saved_count,
+        "tickers_failed": len(tickers) - saved_count,
+        "days_requested": days,
+    }
+
+    if output_format == "json":
+        return json.dumps(summary, ensure_ascii=False, indent=2)
+    return (
+        f"Stockbit market data refresh complete.\n"
+        f"- **Universe**: {universe_key} ({len(tickers)} tickers)\n"
+        f"- **Saved**: {saved_count} tickers updated in cache\n"
+        f"- **Failed**: {len(tickers) - saved_count}\n"
+        f"- **Period**: {days} days"
+    )
+
+
+@mcp.tool()
+def get_intraday_analysis(
+    ticker: str,
+    lookback_days: int = 1,
+    output_format: str = "markdown",
+) -> str:
+    """Return intraday VWAP, opening gap, and volume profile for a ticker.
+
+    Fetches 1-minute candles from Stockbit (available for last ~7 trading days).
+    Use this in Fase Pagi for entry timing and VWAP-relative positioning.
+
+    Args:
+        ticker: IDX ticker (e.g. 'BBRI', 'MEDC'). Without .JK suffix.
+        lookback_days: Trading days to fetch (1-7). Default 1 (today/last day).
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if lookback_days < 1 or lookback_days > 7:
+        errors.append("lookback_days must be between 1 and 7.")
+    if errors:
+        return _validation_error(errors)
+
+    from interday_liquidity_screener.stockbit_market_data import (
+        fetch_intraday_candles,
+        fetch_daily_ohlcv_stockbit,
+        compute_vwap,
+        compute_opening_gap,
+        compute_volume_profile,
+        reset_session,
+    )
+
+    reset_session()  # Ensure fresh budget independent of any prior pipeline run
+    ticker_clean = ticker.replace(".JK", "").upper()
+
+    try:
+        intraday = fetch_intraday_candles(ticker_clean, lookback_days=lookback_days)
+    except Exception as e:
+        logger.exception("Failed to fetch intraday for %s", ticker_clean)
+        return f"Error fetching intraday data for {ticker_clean}: {e}"
+
+    if not intraday:
+        return f"No intraday data available for {ticker_clean}. Market may be closed or data unavailable."
+
+    # Determine the trading date from the data
+    trading_date = intraday[-1].datetime[:10]  # most recent bar's date
+    target = date.fromisoformat(trading_date)
+
+    # VWAP
+    vwap_data = compute_vwap(intraday, target_date=target)
+
+    # Opening gap: need previous day's close
+    try:
+        daily = fetch_daily_ohlcv_stockbit(ticker_clean, days=7)
+        prev_close = None
+        for bar in reversed(daily):
+            if bar.date < trading_date:
+                prev_close = bar.close
+                break
+        gap_data = compute_opening_gap(intraday, prev_close or 0) if prev_close else {"gap_pct": None}
+    except Exception:
+        gap_data = {"gap_pct": None, "note": "Could not fetch previous close"}
+
+    # Volume profile
+    vol_profile = compute_volume_profile(intraday, target_date=target)
+
+    result = {
+        "ticker": ticker_clean,
+        "date": trading_date,
+        "bars": len(intraday),
+        "vwap": vwap_data,
+        "opening_gap": gap_data,
+        "volume_profile": vol_profile,
+    }
+
+    if output_format == "json":
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+    lines = [
+        f"# Intraday Analysis: {ticker_clean} ({trading_date})",
+        "",
+        "## VWAP",
+        f"- **VWAP**: Rp{vwap_data['vwap']:,.2f}" if vwap_data.get("vwap") else "- VWAP: N/A",
+        f"- **Open / Close**: Rp{vwap_data.get('open', 0):,.0f} / Rp{vwap_data.get('close', 0):,.0f}",
+        f"- **High / Low**: Rp{vwap_data.get('high', 0):,.0f} / Rp{vwap_data.get('low', 0):,.0f}",
+        f"- **Total Volume**: {vwap_data.get('total_volume', 0):,}",
+        f"- **Candles**: {vwap_data.get('bar_count', 0)}",
+        "",
+        "## Opening Gap",
+    ]
+    if gap_data.get("gap_pct") is not None:
+        lines.extend([
+            f"- **Gap**: {gap_data['gap_pct']*100:.2f}% ({gap_data.get('direction', '')})",
+            f"- **Open**: Rp{gap_data.get('open_price', 0):,.0f} vs Prev Close: Rp{gap_data.get('previous_close', 0):,.0f}",
+        ])
+    else:
+        lines.append("- Gap data unavailable (no previous close)")
+
+    lines.extend([
+        "",
+        "## Volume Profile",
+        f"- **Peak hour**: {vol_profile.get('peak_hour', '?')}:00",
+        f"- **First 30min**: {vol_profile.get('first_30min_pct', 0):.1f}% of daily volume",
+        f"- **Last 30min**: {vol_profile.get('last_30min_pct', 0):.1f}% of daily volume",
+    ])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_foreign_flow(
+    tickers: str,
+    days: int = 5,
+    output_format: str = "markdown",
+) -> str:
+    """Return net foreign buy/sell flow summary for one or more tickers.
+
+    Uses Stockbit daily data which includes foreignbuy/foreignsell values.
+    Useful for confirming institutional interest before entry.
+
+    Args:
+        tickers: Comma-separated IDX tickers (e.g. 'BBRI,MEDC,PGEO'). Max 5.
+        days: Number of recent trading days to summarize (1-20).
+        output_format: ``markdown`` for humans or ``json`` for structured agent use.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if days < 1 or days > 20:
+        errors.append("days must be between 1 and 20.")
+
+    ticker_list = [t.strip().upper().replace(".JK", "") for t in tickers.split(",") if t.strip()]
+    if not ticker_list:
+        errors.append("At least one ticker is required.")
+    if len(ticker_list) > 5:
+        errors.append("Maximum 5 tickers per call to respect rate limits.")
+    if errors:
+        return _validation_error(errors)
+
+    from interday_liquidity_screener.stockbit_market_data import (
+        fetch_daily_ohlcv_stockbit,
+        compute_foreign_flow_summary,
+    )
+
+    from interday_liquidity_screener.stockbit_market_data import reset_session
+    reset_session()  # Ensure fresh budget independent of any prior pipeline run
+
+    results: dict[str, Any] = {}
+    for tkr in ticker_list:
+        try:
+            daily_bars = fetch_daily_ohlcv_stockbit(tkr, days=max(days + 10, 30))
+            flow = compute_foreign_flow_summary(daily_bars, days=days)
+            results[tkr] = flow
+        except Exception as e:
+            logger.warning("Failed to fetch foreign flow for %s: %s", tkr, e)
+            results[tkr] = {"error": str(e)}
+
+    if output_format == "json":
+        return json.dumps({"tickers": results, "days": days}, ensure_ascii=False, indent=2, default=str)
+
+    lines = [f"# Foreign Flow Summary ({days}D)\n"]
+    for tkr, flow in results.items():
+        if "error" in flow:
+            lines.append(f"## {tkr}: Error — {flow['error']}")
+            continue
+        net = flow.get("net_flow", 0)
+        trend = flow.get("trend", "?")
+        lines.extend([
+            f"## {tkr} — {trend}",
+            f"- **Net flow**: Rp{net:,.0f}",
+            f"- **Buy total**: Rp{flow.get('buy_total', 0):,.0f}",
+            f"- **Sell total**: Rp{flow.get('sell_total', 0):,.0f}",
+            f"- **Positive days**: {flow.get('positive_days', 0)}/{flow.get('days', 0)}",
+            "",
+        ])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def diagnose_run(run_id: str, output_format: str = "json") -> str:
+    """Explain WHY a pipeline run produced its results in one concise summary.
+
+    Analyzes stage-by-stage rejection funnels and returns a structured breakdown
+    of how many tickers were filtered at each gate and the dominant rejection
+    reasons. This saves the agent from calling 4+ inspection tools.
+
+    Args:
+        run_id: The run to diagnose.
+        output_format: ``json`` (default for agents) or ``markdown``.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    run_dir = DEFAULT_RUN_ROOT / run_id
+    if not run_dir.exists():
+        return json.dumps({"error": "RUN_NOT_FOUND", "run_id": run_id}) if output_format == "json" else f"Error: Run '{run_id}' not found."
+
+    diagnosis: dict[str, Any] = {"run_id": run_id, "stages": {}}
+
+    # Stage 1
+    s1_path = run_dir / STAGE_FILES["stage1"]
+    if s1_path.exists():
+        s1 = pd.read_csv(s1_path)
+        total = len(s1)
+        liquid = s1[s1.get("liquidity_bucket", pd.Series(dtype=str)).isin(["HIGH_LIQUIDITY", "GOOD_LIQUIDITY"])].shape[0] if "liquidity_bucket" in s1.columns else 0
+        candidates = s1[s1.get("trade_candidate_bucket", pd.Series(dtype=str)).isin(["STRONG_WATCH", "WATCH"])].shape[0] if "trade_candidate_bucket" in s1.columns else 0
+        vol_median = float(s1["volume_ratio"].median()) if "volume_ratio" in s1.columns else None
+        diagnosis["stages"]["stage1"] = {
+            "total_tickers": total,
+            "liquid": liquid,
+            "trade_candidates": candidates,
+            "filtered_out": total - liquid,
+            "volume_ratio_median": round(vol_median, 2) if vol_median else None,
+        }
+
+    # Stage 4
+    s4_path = run_dir / STAGE_FILES["stage4"]
+    if s4_path.exists():
+        s4 = pd.read_csv(s4_path)
+        status_counts = s4["trade_status"].value_counts().to_dict() if "trade_status" in s4.columns else {}
+        valid = status_counts.get("VALID_TRADE_PLAN", 0) + status_counts.get("DRAFT_PLAN_PENDING_ORDERBOOK", 0)
+        diagnosis["stages"]["stage4"] = {
+            "total": len(s4),
+            "valid_plans": valid,
+            "rejection_breakdown": status_counts,
+        }
+
+    # Hybrid
+    hw_path = run_dir / STAGE_FILES["hybrid_watchlist"]
+    if hw_path.exists():
+        hw = pd.read_csv(hw_path)
+        status_counts = hw["final_status"].value_counts().to_dict() if "final_status" in hw.columns else {}
+        diagnosis["stages"]["hybrid"] = {
+            "total_candidates": len(hw),
+            "status_breakdown": status_counts,
+        }
+
+    # Dominant blockers
+    blockers: list[str] = []
+    s4_info = diagnosis["stages"].get("stage4", {})
+    rejections = s4_info.get("rejection_breakdown", {})
+    if rejections:
+        top_rejection = max(rejections, key=rejections.get)
+        if top_rejection != "VALID_TRADE_PLAN":
+            blockers.append(f"{rejections[top_rejection]}/{s4_info.get('total', 0)} rejected by {top_rejection}")
+    s1_info = diagnosis["stages"].get("stage1", {})
+    if s1_info.get("volume_ratio_median") and s1_info["volume_ratio_median"] < 0.5:
+        blockers.append(f"Volume ratio median={s1_info['volume_ratio_median']} (market day was quiet)")
+    if not blockers:
+        blockers.append("No dominant blocker identified")
+
+    diagnosis["dominant_blockers"] = blockers
+    diagnosis["summary"] = blockers[0] if blockers else "Pipeline completed normally"
+
+    if output_format == "json":
+        return json.dumps(diagnosis, ensure_ascii=False, indent=2, default=str)
+    lines = [f"# Run Diagnosis: {run_id}", ""]
+    for b in blockers:
+        lines.append(f"- **{b}**")
+    for stage, info in diagnosis["stages"].items():
+        lines.append(f"\n## {stage}")
+        for k, v in info.items():
+            lines.append(f"- {k}: {v}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def suggest_next_action(run_id: str, capital: float = 500_000.0, output_format: str = "json") -> str:
+    """Recommend what the agent should do next based on a run's outcome.
+
+    Analyzes the latest run and returns actionable guidance: retry timing,
+    parameter changes, or alternative approaches.
+
+    Args:
+        run_id: The run to base the suggestion on.
+        capital: Current capital context.
+        output_format: ``json`` or ``markdown``.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    run_dir = DEFAULT_RUN_ROOT / run_id
+    if not run_dir.exists():
+        suggestion = {"action": "list_pipeline_runs", "reason": "Run not found. List available runs first."}
+        return json.dumps(suggestion, indent=2) if output_format == "json" else suggestion["reason"]
+
+    # Analyze run
+    hw_path = run_dir / STAGE_FILES["hybrid_watchlist"]
+    s4_path = run_dir / STAGE_FILES["stage4"]
+    suggestions: list[dict[str, str]] = []
+
+    has_valid_plans = False
+    position_too_small_count = 0
+    if s4_path.exists():
+        s4 = pd.read_csv(s4_path)
+        if "trade_status" in s4.columns:
+            counts = s4["trade_status"].value_counts().to_dict()
+            has_valid_plans = counts.get("VALID_TRADE_PLAN", 0) > 0
+            position_too_small_count = counts.get("REJECT_POSITION_TOO_SMALL", 0)
+
+    has_watchlist = False
+    early_watch_count = 0
+    if hw_path.exists():
+        hw = pd.read_csv(hw_path)
+        has_watchlist = len(hw) > 0
+        if "final_status" in hw.columns:
+            early_watch_count = (hw["final_status"] == "EARLY_WATCH").sum()
+
+    from datetime import date as _date
+    is_weekend = _date.today().weekday() >= 5
+
+    if has_valid_plans:
+        suggestions.append({"action": "run_morning_confirmation", "reason": "Valid plans exist. Run orderbook confirmation on next market day.", "priority": "HIGH"})
+    elif position_too_small_count > 0:
+        needed = capital * 2
+        suggestions.append({"action": "increase_capital", "reason": f"{position_too_small_count} tickers rejected for insufficient capital. Consider capital >= Rp{needed:,.0f}.", "priority": "HIGH"})
+        suggestions.append({"action": "what_if", "reason": f"Try what_if(run_id='{run_id}', capital={needed:.0f}) to preview impact.", "priority": "MEDIUM"})
+    if early_watch_count > 0 and not has_valid_plans:
+        if is_weekend:
+            suggestions.append({"action": "wait_monday", "reason": f"{early_watch_count} tickers on EARLY_WATCH. Re-run Monday when volume returns to normal.", "priority": "MEDIUM"})
+        else:
+            suggestions.append({"action": "re_run_tomorrow", "reason": f"{early_watch_count} tickers on EARLY_WATCH. Volume may improve tomorrow.", "priority": "MEDIUM"})
+    if not has_watchlist:
+        suggestions.append({"action": "expand_universe", "reason": "No watchlist candidates. Try a larger universe (idx80 or all_idx).", "priority": "LOW"})
+    if not suggestions:
+        suggestions.append({"action": "wait", "reason": "Market conditions are not favorable. No action needed today.", "priority": "LOW"})
+
+    result = {"run_id": run_id, "capital": capital, "suggestions": suggestions}
+    if output_format == "json":
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    lines = [f"# Suggested Actions for {run_id}", ""]
+    for s in suggestions:
+        lines.append(f"- [{s['priority']}] **{s['action']}**: {s['reason']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def what_if(
+    run_id: str,
+    capital: float | None = None,
+    risk_per_trade_pct: float | None = None,
+    max_position_pct: float | None = None,
+    output_format: str = "json",
+) -> str:
+    """Simulate parameter changes against an existing run WITHOUT re-running the pipeline.
+
+    Instantly recalculates position sizing and affordability for all candidates
+    using the new parameters. Shows how many tickers become tradeable.
+
+    Args:
+        run_id: Existing run with hybrid_watchlist.
+        capital: Simulated capital (e.g. 1000000).
+        risk_per_trade_pct: Simulated risk per trade (e.g. 0.02).
+        max_position_pct: Simulated max position allocation (e.g. 0.80).
+        output_format: ``json`` or ``markdown``.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    run_dir = DEFAULT_RUN_ROOT / run_id
+    s4_path = run_dir / STAGE_FILES["stage4"]
+    if not s4_path.exists():
+        return json.dumps({"error": "NO_STAGE4_DATA", "run_id": run_id}) if output_format == "json" else f"Error: Stage 4 data not found for run '{run_id}'."
+
+    s4 = pd.read_csv(s4_path)
+    sim_capital = capital or 500_000
+    sim_risk_pct = risk_per_trade_pct or 0.01
+    sim_max_pos_pct = max_position_pct or 0.80
+
+    risk_amount = sim_capital * sim_risk_pct
+    max_position_value = sim_capital * sim_max_pos_pct
+
+    results: list[dict[str, Any]] = []
+    for _, row in s4.iterrows():
+        entry = pd.to_numeric(row.get("entry_price"), errors="coerce")
+        sl = pd.to_numeric(row.get("stop_loss"), errors="coerce")
+        tp1 = pd.to_numeric(row.get("take_profit_1"), errors="coerce")
+        ticker = row.get("ticker", "?")
+
+        if pd.isna(entry) or pd.isna(sl) or entry <= 0 or sl <= 0 or sl >= entry:
+            results.append({"ticker": ticker, "affordable": False, "reason": "no_valid_plan"})
+            continue
+
+        risk_per_share = entry - sl
+        risk_per_lot = risk_per_share * 100
+        lot_cost = entry * 100
+
+        risk_lots = int(risk_amount / risk_per_lot) if risk_per_lot > 0 else 0
+        capital_lots = int(max_position_value / lot_cost) if lot_cost > 0 else 0
+        lots = min(risk_lots, capital_lots)
+
+        affordable = lots >= 1
+        position_value = lots * lot_cost
+        expected_profit = lots * 100 * (tp1 - entry) * 0.995 if pd.notna(tp1) and affordable else 0
+
+        results.append({
+            "ticker": ticker,
+            "affordable": affordable,
+            "lots": lots,
+            "position_value": round(position_value),
+            "expected_profit": round(expected_profit),
+            "entry": entry,
+            "tp1": tp1,
+            "sl": sl,
+            "reason": "affordable" if affordable else ("risk_budget_too_small" if risk_lots < 1 else "position_cap_too_small"),
+        })
+
+    affordable_tickers = [r for r in results if r["affordable"]]
+    summary = {
+        "run_id": run_id,
+        "simulated_params": {"capital": sim_capital, "risk_per_trade_pct": sim_risk_pct, "max_position_pct": sim_max_pos_pct},
+        "total_with_plan": sum(1 for r in results if r["reason"] != "no_valid_plan"),
+        "affordable_count": len(affordable_tickers),
+        "not_affordable_count": sum(1 for r in results if not r["affordable"] and r["reason"] != "no_valid_plan"),
+        "affordable_tickers": affordable_tickers,
+        "total_expected_profit": sum(r["expected_profit"] for r in affordable_tickers),
+    }
+
+    if output_format == "json":
+        return json.dumps(summary, ensure_ascii=False, indent=2, default=str)
+    lines = [
+        f"# What-If Simulation: {run_id}",
+        f"- Capital: Rp{sim_capital:,.0f}, Risk: {sim_risk_pct*100:.1f}%, Max pos: {sim_max_pos_pct*100:.0f}%",
+        f"- Affordable: **{len(affordable_tickers)}** tickers",
+        f"- Total expected profit: Rp{summary['total_expected_profit']:,.0f}",
+        "",
+    ]
+    for t in affordable_tickers:
+        lines.append(f"  - {t['ticker']}: {t['lots']} lots, profit Rp{t['expected_profit']:,.0f}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def compare_runs(run_id_a: str, run_id_b: str, output_format: str = "json") -> str:
+    """Compare two pipeline runs side-by-side to identify improvements or regressions.
+
+    Args:
+        run_id_a: First (older) run.
+        run_id_b: Second (newer) run.
+        output_format: ``json`` or ``markdown``.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    def _run_stats(rid: str) -> dict[str, Any]:
+        rd = DEFAULT_RUN_ROOT / rid
+        if not rd.exists():
+            return {"error": f"Run '{rid}' not found"}
+        try:
+            info = summarize_run(rd)
+        except Exception:
+            info = {}
+        hw_path = rd / STAGE_FILES["hybrid_watchlist"]
+        status_breakdown = {}
+        avg_score = 0.0
+        if hw_path.exists():
+            hw = pd.read_csv(hw_path)
+            if "final_status" in hw.columns:
+                status_breakdown = hw["final_status"].value_counts().to_dict()
+            if "final_score" in hw.columns:
+                avg_score = float(hw["final_score"].mean())
+        return {
+            "run_id": rid,
+            "stage1_rows": info.get("stage1_rows", 0),
+            "valid_trade_plans": info.get("valid_trade_plans", 0),
+            "win_rate": info.get("win_rate"),
+            "report_available": info.get("report_available", False),
+            "watchlist_count": sum(status_breakdown.values()),
+            "avg_score": round(avg_score, 1),
+            "status_breakdown": status_breakdown,
+        }
+
+    stats_a = _run_stats(run_id_a)
+    stats_b = _run_stats(run_id_b)
+
+    if "error" in stats_a or "error" in stats_b:
+        return json.dumps({"a": stats_a, "b": stats_b}, indent=2)
+
+    comparison = {
+        "run_a": stats_a,
+        "run_b": stats_b,
+        "delta": {
+            "valid_trade_plans": stats_b["valid_trade_plans"] - stats_a["valid_trade_plans"],
+            "watchlist_count": stats_b["watchlist_count"] - stats_a["watchlist_count"],
+            "avg_score": round(stats_b["avg_score"] - stats_a["avg_score"], 1),
+        },
+        "verdict": (
+            "IMPROVED" if stats_b["valid_trade_plans"] > stats_a["valid_trade_plans"]
+            else "REGRESSED" if stats_b["valid_trade_plans"] < stats_a["valid_trade_plans"]
+            else "SAME"
+        ),
+    }
+
+    if output_format == "json":
+        return json.dumps(comparison, ensure_ascii=False, indent=2, default=str)
+    lines = [
+        f"# Run Comparison: {run_id_a} vs {run_id_b}",
+        f"- Verdict: **{comparison['verdict']}**",
+        f"- Valid plans: {stats_a['valid_trade_plans']} → {stats_b['valid_trade_plans']} ({comparison['delta']['valid_trade_plans']:+d})",
+        f"- Watchlist: {stats_a['watchlist_count']} → {stats_b['watchlist_count']} ({comparison['delta']['watchlist_count']:+d})",
+        f"- Avg score: {stats_a['avg_score']} → {stats_b['avg_score']} ({comparison['delta']['avg_score']:+.1f})",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_insider_activity(lookback_days: int = 7, output_format: str = "json") -> str:
+    """Return recent insider buy/sell transactions from IDX (directors, commissioners, major holders).
+
+    Insider buying = strongest accumulation signal. Multiple buys at same price = defended support level.
+    Insider selling = distribution warning.
+
+    Args:
+        lookback_days: Days to look back (1-30). Default 7.
+        output_format: ``json`` for agents or ``markdown`` for humans.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if lookback_days < 1 or lookback_days > 30:
+        errors.append("lookback_days must be between 1 and 30.")
+    if errors:
+        return _validation_error(errors)
+
+    from interday_liquidity_screener.insider_tracker import (
+        fetch_insider_transactions,
+        analyze_insider_activity,
+    )
+
+    try:
+        transactions = fetch_insider_transactions(limit=50, use_cache=True)
+    except Exception as e:
+        return f"Error fetching insider data: {e}"
+
+    if not transactions:
+        if output_format == "json":
+            return json.dumps({"count": 0, "tickers": {}}, indent=2)
+        return "No insider transactions found."
+
+    activity = analyze_insider_activity(transactions, lookback_days=lookback_days)
+
+    if output_format == "json":
+        return json.dumps(
+            {"count": len(activity), "lookback_days": lookback_days, "tickers": activity},
+            ensure_ascii=False, indent=2, default=str,
+        )
+
+    lines = [f"# Insider Activity ({lookback_days}D)\n"]
+    # Sort by score adjustment (strongest signal first)
+    sorted_tickers = sorted(activity.items(), key=lambda x: x[1]["score_adjustment"], reverse=True)
+    for ticker, info in sorted_tickers:
+        emoji = "🟢" if info["score_adjustment"] > 0 else "🔴" if info["score_adjustment"] < 0 else "⚪"
+        lines.append(f"## {emoji} {ticker} — {info['signal']}")
+        lines.append(f"- Buys: {info['buy_count']}, Sells: {info['sell_count']}, Net: {info['net_shares']:+,} shares")
+        if info["avg_buy_price"] > 0:
+            lines.append(f"- Avg buy price: Rp{info['avg_buy_price']:,.0f} (implicit support)")
+        lines.append(f"- Investors: {', '.join(info['investors'])}")
+        lines.append(f"- Score adjustment: **{info['score_adjustment']:+d}** points")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_dividend_calendar(output_format: str = "json") -> str:
+    """Return upcoming dividend events (cum-dates, ex-dates, yields).
+
+    Use this to:
+    - BLOCK trades on ex-date (guaranteed price drop)
+    - Identify cum-date plays (buy before cum for dividend)
+    - Adjust SL for stocks near ex-date
+
+    Args:
+        output_format: ``json`` for agents or ``markdown`` for humans.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    from interday_liquidity_screener.dividend_tracker import (
+        fetch_upcoming_dividends,
+        get_exdate_tickers,
+    )
+    from datetime import date as _d
+
+    try:
+        events = fetch_upcoming_dividends(use_cache=True)
+    except Exception as e:
+        return f"Error fetching dividend data: {e}"
+
+    if not events:
+        if output_format == "json":
+            return json.dumps({"count": 0, "events": [], "exdate_today": []}, indent=2)
+        return "No upcoming dividend events."
+
+    today = _d.today()
+    exdate_today = get_exdate_tickers(events, today)
+    exdate_tomorrow = get_exdate_tickers(events, today + pd.Timedelta(days=1))
+
+    if output_format == "json":
+        event_list = [
+            {
+                "ticker": e.ticker,
+                "cum_date": e.cum_date,
+                "ex_date": e.ex_date,
+                "pay_date": e.pay_date,
+                "dividend_per_share": e.dividend_per_share,
+                "last_price": e.last_price,
+                "yield_pct": round(e.yield_pct, 2),
+                "is_active": e.is_active,
+            }
+            for e in events
+        ]
+        return json.dumps(
+            {"count": len(events), "events": event_list, "exdate_today": exdate_today, "exdate_tomorrow": exdate_tomorrow},
+            ensure_ascii=False, indent=2,
+        )
+
+    lines = ["# Dividend Calendar\n"]
+    if exdate_today:
+        lines.append(f"⚠️ **EX-DATE TODAY** (DO NOT BUY): {', '.join(exdate_today)}\n")
+    if exdate_tomorrow:
+        lines.append(f"⚠️ **EX-DATE TOMORROW**: {', '.join(exdate_tomorrow)}\n")
+    lines.append("| Ticker | Cum-Date | Ex-Date | Div/Share | Price | Yield |")
+    lines.append("|--------|----------|---------|-----------|-------|-------|")
+    for e in events[:20]:
+        lines.append(f"| {e.ticker} | {e.cum_date} | {e.ex_date} | Rp{e.dividend_per_share:,.0f} | Rp{e.last_price:,.0f} | {e.yield_pct:.1f}% |")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def validate_token(output_format: str = "json") -> str:
+    """Test if the Stockbit token is valid by making a lightweight API call.
+
+    Call this FIRST if you get 401 errors from other tools. If invalid,
+    tell the user to login to Stockbit web and let the userscript sync the token.
+
+    Args:
+        output_format: ``json`` or ``markdown``.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    from interday_liquidity_screener.stockbit_collector import validate_stockbit_token, get_stockbit_token
+
+    # Force re-read .env
+    try:
+        token = get_stockbit_token()
+    except RuntimeError as e:
+        if output_format == "json":
+            return json.dumps({"valid": False, "message": str(e), "action": "Set STOCKBIT_TOKEN in .env"}, indent=2)
+        return f"❌ Token not found: {e}"
+
+    is_valid, message = validate_stockbit_token(token)
+
+    result = {
+        "valid": is_valid,
+        "message": message,
+        "token_preview": f"...{token[-4:]}" if len(token) > 4 else "too_short",
+        "action": None if is_valid else "Login to stockbit.com in browser → userscript will auto-sync token → retry.",
+    }
+
+    if output_format == "json":
+        return json.dumps(result, indent=2)
+    if is_valid:
+        return f"✅ Stockbit token valid (preview: ...{token[-4:]})"
+    return f"❌ {message}\n\n**Action**: Login ke stockbit.com di browser, biarkan userscript auto-sync, lalu coba lagi."
+
+
+@mcp.tool()
 def get_live_monitor_status() -> str:
     """Read the latest alerts and status from the live ticker monitor."""
     status_path = Path("data/output/live_monitor_status.json")
@@ -2377,14 +3215,28 @@ def workflow_resource() -> str:
 @mcp.prompt()
 def evening_scan_workflow(universe_key: str = "lq45", capital: float = 1_000_000.0) -> str:
     """Prompt template guiding the malam -> pagi professional scan workflow."""
+    from datetime import date as _d
+    is_weekend = _d.today().weekday() >= 5
+    if is_weekend:
+        return (
+            "It is currently the weekend. The IDX market is closed.\n"
+            "Recommended actions:\n"
+            "1. Call list_pipeline_runs to review the most recent weekday run.\n"
+            "2. Call diagnose_run(run_id) to understand why results were as they were.\n"
+            "3. Call what_if(run_id, capital=...) to simulate different parameters.\n"
+            "4. Call suggest_next_action(run_id) for Monday planning.\n"
+            "Do NOT run a new pipeline scan — there is no new market data on weekends."
+        )
     return (
         "You are operating the IDX Interday Trading MCP server. Follow this order:\n"
         "1. Call get_system_health to confirm preflight is OK.\n"
         f"2. Start the evening scan with start_pipeline_run(universe_key='{universe_key}', "
         f"capital={capital:.0f}, run_phase='malam') and poll get_pipeline_run_status.\n"
-        "3. When the job succeeds, call get_run_bundle(run_id) to review audit, watchlist, and recommendation together.\n"
-        "4. On market morning, call run_morning_confirmation(resume_run_id=run_id) for live orderbook confirmation.\n"
-        "5. Re-check get_trade_recommendation before any manual execution decision.\n"
+        "3. When the job succeeds, call diagnose_run(run_id) to understand the results.\n"
+        "4. If 0 valid plans, call suggest_next_action(run_id) for guidance.\n"
+        "5. If candidates exist, call get_run_bundle(run_id) for full review.\n"
+        "6. On market morning, call run_morning_confirmation(resume_run_id=run_id).\n"
+        "7. Re-check get_trade_recommendation before any manual execution decision.\n"
         "Remember: this server is decision support only and never places orders."
     )
 

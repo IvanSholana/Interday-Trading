@@ -1190,19 +1190,39 @@ def trigger_run(payload: RunRequest, background_tasks: BackgroundTasks):
     with pipeline_state.lock:
         if pipeline_state.status == "running":
             raise HTTPException(status_code=400, detail="A pipeline is already running")
-            
-    run_id = payload.resume_run_id if payload.resume_run_id else create_run_id()
+        # Immediately claim the slot inside the lock to prevent race conditions.
+        # All preparation (ticker loading, file writing) happens AFTER we hold the slot.
+        pipeline_state.status = "running"
+        pipeline_state.run_id = payload.resume_run_id or create_run_id()
+        pipeline_state.progress = 0.0
+        pipeline_state.current_stage = "Initialization"
+        pipeline_state.logs = []
+        pipeline_state.error_message = None
+        pipeline_state.cancel_event.clear()
+
+    run_id = pipeline_state.run_id
     run_paths = build_run_paths(DEFAULT_RUN_ROOT, run_id)
     
-    tickers_list = []
-    if payload.universe_key != "manual":
-        from .ticker_universe import load_universe_tickers
-        tickers_list = load_universe_tickers(payload.universe_key)
-    else:
-        tickers_list = parse_ticker_text(payload.tickers)
-        
-    if not tickers_list:
-        raise HTTPException(status_code=400, detail="Ticker list is empty. Please enter tickers or choose a preset.")
+    try:
+        tickers_list = []
+        if payload.universe_key != "manual":
+            from .ticker_universe import load_universe_tickers
+            tickers_list = load_universe_tickers(payload.universe_key)
+        else:
+            tickers_list = parse_ticker_text(payload.tickers)
+            
+        if not tickers_list:
+            with pipeline_state.lock:
+                pipeline_state.status = "failed"
+                pipeline_state.error_message = "Ticker list is empty."
+            raise HTTPException(status_code=400, detail="Ticker list is empty. Please enter tickers or choose a preset.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        with pipeline_state.lock:
+            pipeline_state.status = "failed"
+            pipeline_state.error_message = str(exc)
+        raise HTTPException(status_code=500, detail=str(exc))
         
     ticker_file_path = DEFAULT_INPUT_ROOT / f"ui_tickers_{run_id}.txt"
     ticker_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1238,13 +1258,7 @@ def trigger_run(payload: RunRequest, background_tasks: BackgroundTasks):
     )
     
     with pipeline_state.lock:
-        pipeline_state.run_id = run_id
-        pipeline_state.status = "running"
-        pipeline_state.progress = 0.0
-        pipeline_state.current_stage = "Initialization"
-        pipeline_state.logs = []
-        pipeline_state.error_message = None
-        pipeline_state.cancel_event.clear()
+        pipeline_state.current_stage = "Starting pipeline thread"
         
     thread = threading.Thread(
         target=run_pipeline_thread,
@@ -1336,6 +1350,109 @@ def run_scheduled_task(task: ScheduledTaskModel, background_tasks: BackgroundTas
 
 # Serve compiled React static files (in production)
 static_dir = Path(__file__).resolve().parent / "static"
+# ---------------------------------------------------------------------------
+# Agent-optimized API endpoints (mirrors MCP tools for frontend access)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/diagnose/{run_id}")
+def api_diagnose_run(run_id: str):
+    """Diagnose why a run produced its results — stage-by-stage rejection funnel."""
+    from .mcp_server import diagnose_run
+    result = diagnose_run(run_id, output_format="json")
+    return JSONResponse(content=json.loads(result))
+
+
+@app.get("/api/suggest/{run_id}")
+def api_suggest_next_action(run_id: str, capital: float = 500_000):
+    """Suggest what to do next based on run outcome."""
+    from .mcp_server import suggest_next_action
+    result = suggest_next_action(run_id, capital=capital, output_format="json")
+    return JSONResponse(content=json.loads(result))
+
+
+class WhatIfRequest(BaseModel):
+    run_id: str
+    capital: Optional[float] = None
+    risk_per_trade_pct: Optional[float] = None
+    max_position_pct: Optional[float] = None
+
+
+@app.post("/api/what-if")
+def api_what_if(req: WhatIfRequest):
+    """Simulate parameter changes against an existing run without re-running."""
+    from .mcp_server import what_if
+    result = what_if(
+        run_id=req.run_id,
+        capital=req.capital,
+        risk_per_trade_pct=req.risk_per_trade_pct,
+        max_position_pct=req.max_position_pct,
+        output_format="json",
+    )
+    return JSONResponse(content=json.loads(result))
+
+
+@app.get("/api/compare")
+def api_compare_runs(run_a: str = Query(...), run_b: str = Query(...)):
+    """Compare two pipeline runs side-by-side."""
+    from .mcp_server import compare_runs
+    result = compare_runs(run_a, run_b, output_format="json")
+    return JSONResponse(content=json.loads(result))
+
+
+@app.get("/api/insider")
+def api_insider_activity(lookback_days: int = 7):
+    """Get recent insider buy/sell transactions."""
+    from .mcp_server import get_insider_activity
+    result = get_insider_activity(lookback_days=lookback_days, output_format="json")
+    return JSONResponse(content=json.loads(result))
+
+
+@app.get("/api/dividends")
+def api_dividend_calendar():
+    """Get upcoming dividend events (cum-dates, ex-dates, yields)."""
+    from .mcp_server import get_dividend_calendar
+    result = get_dividend_calendar(output_format="json")
+    return JSONResponse(content=json.loads(result))
+
+
+@app.get("/api/intraday/{ticker}")
+def api_intraday_analysis(ticker: str, lookback_days: int = 1):
+    """Get intraday VWAP, gap, and volume profile for a ticker."""
+    from .mcp_server import get_intraday_analysis
+    result = get_intraday_analysis(ticker=ticker, lookback_days=lookback_days, output_format="json")
+    try:
+        return JSONResponse(content=json.loads(result))
+    except json.JSONDecodeError:
+        return JSONResponse(content={"error": result}, status_code=400)
+
+
+@app.get("/api/foreign-flow")
+def api_foreign_flow(tickers: str = Query(...), days: int = 5):
+    """Get net foreign buy/sell flow for tickers."""
+    from .mcp_server import get_foreign_flow
+    result = get_foreign_flow(tickers=tickers, days=days, output_format="json")
+    try:
+        return JSONResponse(content=json.loads(result))
+    except json.JSONDecodeError:
+        return JSONResponse(content={"error": result}, status_code=400)
+
+
+@app.post("/api/refresh-stockbit")
+def api_refresh_stockbit(universe_key: str = "lq45", days: int = 365):
+    """Refresh market data from Stockbit for a universe."""
+    from .mcp_server import refresh_market_data_stockbit
+    result = refresh_market_data_stockbit(universe_key=universe_key, days=days, output_format="json")
+    try:
+        return JSONResponse(content=json.loads(result))
+    except json.JSONDecodeError:
+        return JSONResponse(content={"message": result})
+
+
+# ---------------------------------------------------------------------------
+# Static files mount (MUST be last)
+# ---------------------------------------------------------------------------
+
 if static_dir.exists():
     app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 else:

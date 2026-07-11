@@ -202,6 +202,111 @@ def _optional_float(value: Any) -> float | None:
     return float(value)
 
 
+# ---------------------------------------------------------------------------
+# Data source selection: Stockbit (preferred) → yfinance (fallback)
+# ---------------------------------------------------------------------------
+
+_DATA_SOURCE: str = "stockbit"  # "stockbit" or "yfinance"
+
+
+def _download_stockbit_ohlcv(
+    ticker: str,
+    period: str | None = None,
+    start: date | None = None,
+    end: date | None = None,
+) -> pd.DataFrame:
+    """Fetch daily OHLCV from Stockbit Exodus API for a single ticker.
+
+    Returns a DataFrame compatible with the cache (DatetimeIndex + OHLCV columns).
+    """
+    from .stockbit_market_data import (
+        fetch_daily_ohlcv_stockbit,
+        daily_bars_to_dataframe,
+        StockbitFetchConfig,
+    )
+    # Convert .JK ticker to plain ticker for Stockbit
+    clean_ticker = ticker.replace(".JK", "")
+
+    # Determine days from period or date range
+    if start is not None and end is not None:
+        days = (end - start).days + 1
+    elif period:
+        days_map = {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "max": 500}
+        days = days_map.get(period, 365)
+    else:
+        days = 365
+
+    config = StockbitFetchConfig(
+        min_delay_sec=2.0,
+        max_delay_sec=5.0,
+        max_requests_per_session=200,
+        simulate_session_open=False,  # Skip session open for batch efficiency
+    )
+
+    try:
+        bars = fetch_daily_ohlcv_stockbit(clean_ticker, days=days, config=config)
+        if not bars:
+            return pd.DataFrame()
+        df = daily_bars_to_dataframe(bars)
+        # Filter by start/end if specified
+        if start is not None and not df.empty:
+            df = df[df.index >= pd.Timestamp(start)]
+        if end is not None and not df.empty:
+            df = df[df.index <= pd.Timestamp(end)]
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _download_stockbit_ohlcv_batch(
+    tickers: list[str],
+    period: str | None = None,
+    start: date | None = None,
+    end: date | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Fetch daily OHLCV from Stockbit for multiple tickers with pacing."""
+    from .stockbit_market_data import (
+        fetch_daily_ohlcv_batch_stockbit,
+        daily_bars_to_dataframe,
+        StockbitFetchConfig,
+        reset_session,
+    )
+
+    if start is not None and end is not None:
+        days = (end - start).days + 1
+    elif period:
+        days_map = {"1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "max": 500}
+        days = days_map.get(period, 365)
+    else:
+        days = 365
+
+    clean_tickers = [t.replace(".JK", "") for t in tickers]
+    config = StockbitFetchConfig(
+        min_delay_sec=2.0,
+        max_delay_sec=5.0,
+        max_requests_per_session=len(clean_tickers) + 10,
+        simulate_session_open=True,
+    )
+
+    reset_session()
+    try:
+        raw_results = fetch_daily_ohlcv_batch_stockbit(clean_tickers, days=days, config=config)
+    except Exception:
+        return {}
+
+    results: dict[str, pd.DataFrame] = {}
+    for clean_tkr, bars in raw_results.items():
+        yahoo_tkr = f"{clean_tkr}.JK"
+        if bars:
+            df = daily_bars_to_dataframe(bars)
+            if start is not None and not df.empty:
+                df = df[df.index >= pd.Timestamp(start)]
+            results[yahoo_tkr] = df
+        else:
+            results[yahoo_tkr] = pd.DataFrame()
+    return results
+
+
 def download_yfinance_ohlcv(
     tickers: str | list[str],
     period: str | None = None,
@@ -227,6 +332,51 @@ def download_yfinance_ohlcv(
     else:
         kwargs["period"] = period
     return yf.download(**kwargs)
+
+
+def _fetch_single_ticker(
+    ticker: str,
+    period: str | None = None,
+    interval: str = "1d",
+    start: date | None = None,
+    end: date | None = None,
+) -> pd.DataFrame:
+    """Fetch OHLCV for a single ticker using the configured data source.
+
+    Tries Stockbit first (if configured and token available), falls back to yfinance.
+    Logs a warning when falling back so downstream consumers know the data source.
+    """
+    if _DATA_SOURCE == "stockbit" and interval == "1d":
+        try:
+            from .stockbit_collector import get_stockbit_token
+            token = get_stockbit_token()
+            if token:
+                df = _download_stockbit_ohlcv(ticker, period=period, start=start, end=end)
+                if not df.empty:
+                    return df
+                import logging
+                logging.getLogger(__name__).warning(
+                    "DATA_SOURCE_FALLBACK: Stockbit returned empty for %s — falling back to yfinance. "
+                    "Prices may differ from IDX real-time.",
+                    ticker,
+                )
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "DATA_SOURCE_FALLBACK: Stockbit token unavailable — using yfinance for %s. "
+                    "Check STOCKBIT_TOKEN in .env.",
+                    ticker,
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "DATA_SOURCE_FALLBACK: Stockbit error for %s (%s) — using yfinance.",
+                ticker, exc,
+            )
+    return download_yfinance_ohlcv(
+        ticker, period=period, interval=interval,
+        start=start, end=end, threads=False,
+    )
 
 
 def _today_bar_is_stale(cache: MarketDataCache, ticker: str, today: date, interval: str = "1d") -> bool:
@@ -269,23 +419,25 @@ def get_incremental_ohlcv(
     today = date.today()
     required_start = period_start_date(period, today)
     first_cached, last_cached = cache.coverage(ticker, interval)
+    is_weekend = today.weekday() >= 5
 
     fetch_full_period = refresh or first_cached is None
     if required_start is not None and first_cached is not None and first_cached > required_start:
         fetch_full_period = True
 
     if fetch_full_period:
-        fetched = download_yfinance_ohlcv(ticker, period=period, interval=interval, threads=False)
+        fetched = _fetch_single_ticker(ticker, period=period, interval=interval)
         cache.save_ohlcv(ticker, fetched, interval)
     elif last_cached is not None:
         next_date = last_cached + timedelta(days=1)
         end_date = today + timedelta(days=1)
-        if next_date <= today:
-            fetched = download_yfinance_ohlcv(ticker, interval=interval, start=next_date, end=end_date, threads=False)
+        # Skip fetch on weekends if we already have the last trading day
+        skip_weekend = is_weekend and (today - last_cached <= timedelta(days=2))
+        if next_date <= today and not skip_weekend:
+            fetched = _fetch_single_ticker(ticker, interval=interval, start=next_date, end=end_date)
             cache.save_ohlcv(ticker, fetched, interval)
         elif last_cached == today and _today_bar_is_stale(cache, ticker, today, interval):
-            # Bar for today exists but was cached before market close — re-fetch.
-            fetched = download_yfinance_ohlcv(ticker, interval=interval, start=today, end=end_date, threads=False)
+            fetched = _fetch_single_ticker(ticker, interval=interval, start=today, end=end_date)
             cache.save_ohlcv(ticker, fetched, interval)
 
     return cache.load_ohlcv(ticker, interval, start_date=required_start)
@@ -307,12 +459,22 @@ def get_incremental_ohlcv_batch(
     stale_incremental: dict[date, list[str]] = {}
     stale_today: list[str] = []
 
+    # On weekends/holidays, the last trading day is already in cache.
+    # Don't attempt incremental fetches that would hit the API for nothing.
+    is_weekend = today.weekday() >= 5  # Saturday=5, Sunday=6
+
     for ticker in tickers:
         first_cached, last_cached = cache.coverage(ticker, interval)
         if refresh or first_cached is None or (required_start is not None and first_cached > required_start):
             stale_full.append(ticker)
         elif last_cached is not None and last_cached < today:
-            stale_incremental.setdefault(last_cached + timedelta(days=1), []).append(ticker)
+            # Skip incremental if it's a weekend and cache has Friday's data
+            if is_weekend and last_cached.weekday() == 4:
+                pass  # Cache already has Friday — no new data on weekend
+            elif is_weekend and today - last_cached <= timedelta(days=2):
+                pass  # Cache is within weekend gap — skip
+            else:
+                stale_incremental.setdefault(last_cached + timedelta(days=1), []).append(ticker)
         elif last_cached == today and _today_bar_is_stale(cache, ticker, today, interval):
             stale_today.append(ticker)
 
@@ -354,10 +516,38 @@ def _fetch_and_store_batches(
 ) -> None:
     if not tickers:
         return
+
+    # Try Stockbit batch first for daily data
+    if _DATA_SOURCE == "stockbit" and interval == "1d":
+        try:
+            from .stockbit_collector import get_stockbit_token
+            token = get_stockbit_token()
+        except Exception:
+            token = ""
+        if token:
+            print(f"Fetching {len(tickers)} tickers from Stockbit (daily)...")
+            stockbit_results = _download_stockbit_ohlcv_batch(tickers, period=period, start=start, end=end)
+            fetched_from_stockbit: set[str] = set()
+            for ticker, df in stockbit_results.items():
+                if not df.empty:
+                    cache.save_ohlcv(ticker, df, interval)
+                    fetched_from_stockbit.add(ticker)
+            remaining = [t for t in tickers if t not in fetched_from_stockbit]
+            if not remaining:
+                return
+            import logging
+            logging.getLogger(__name__).warning(
+                "DATA_SOURCE_FALLBACK: Stockbit got %d/%d. Falling back to yfinance for %d tickers: %s",
+                len(fetched_from_stockbit), len(tickers), len(remaining),
+                remaining[:5],
+            )
+            tickers = remaining
+
+    # Fallback: yfinance batch
     batches = [tickers[index : index + batch_size] for index in range(0, len(tickers), batch_size)]
     mode = "incremental" if start else "full"
     for batch_index, batch in enumerate(batches, start=1):
-        print(f"Downloading {mode} OHLCV batch {batch_index}/{len(batches)}: {len(batch)} tickers")
+        print(f"Downloading {mode} OHLCV batch {batch_index}/{len(batches)}: {len(batch)} tickers (yfinance)")
         data = download_yfinance_ohlcv(batch, period=period, interval=interval, start=start, end=end, threads=True)
         if data is None or data.empty:
             continue

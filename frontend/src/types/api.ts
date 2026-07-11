@@ -406,3 +406,131 @@ export interface LiveMonitorStartRequest {
   interval_seconds: number;
   bypass_market_hours: boolean;
 }
+
+
+// ---------------------------------------------------------------------------
+// Agent-optimized endpoints (new)
+// ---------------------------------------------------------------------------
+
+/** GET /api/diagnose/:run_id — Stage-by-stage rejection funnel. */
+export interface DiagnoseResult {
+  run_id: string;
+  summary: string;
+  dominant_blockers: string[];
+  stages: {
+    stage1?: { total_tickers: number; liquid: number; trade_candidates: number; filtered_out: number; volume_ratio_median: number | null };
+    stage4?: { total: number; valid_plans: number; rejection_breakdown: Record<string, number> };
+    hybrid?: { total_candidates: number; status_breakdown: Record<string, number> };
+  };
+}
+
+/** GET /api/suggest/:run_id — Actionable next-step recommendations. */
+export interface SuggestResult {
+  run_id: string;
+  capital: number;
+  suggestions: Array<{
+    action: string;
+    reason: string;
+    priority: 'HIGH' | 'MEDIUM' | 'LOW';
+  }>;
+}
+
+/** POST /api/what-if — Parameter simulation without re-running. */
+export interface WhatIfRequest {
+  run_id: string;
+  capital?: number;
+  risk_per_trade_pct?: number;
+  max_position_pct?: number;
+}
+
+export interface WhatIfResult {
+  run_id: string;
+  simulated_params: { capital: number; risk_per_trade_pct: number; max_position_pct: number };
+  total_with_plan: number;
+  affordable_count: number;
+  not_affordable_count: number;
+  affordable_tickers: Array<{
+    ticker: string;
+    affordable: boolean;
+    lots: number;
+    position_value: number;
+    expected_profit: number;
+    entry: number;
+    tp1: number;
+    sl: number;
+    reason: string;
+  }>;
+  total_expected_profit: number;
+}
+
+/** GET /api/compare — Side-by-side run comparison. */
+export interface CompareResult {
+  run_a: { run_id: string; valid_trade_plans: number; watchlist_count: number; avg_score: number };
+  run_b: { run_id: string; valid_trade_plans: number; watchlist_count: number; avg_score: number };
+  delta: { valid_trade_plans: number; watchlist_count: number; avg_score: number };
+  verdict: 'IMPROVED' | 'REGRESSED' | 'SAME';
+}
+
+/** GET /api/insider — Insider buy/sell activity. */
+export interface InsiderActivity {
+  count: number;
+  lookback_days: number;
+  tickers: Record<string, {
+    signal: string;
+    score_adjustment: number;
+    buy_count: number;
+    sell_count: number;
+    net_shares: number;
+    avg_buy_price: number;
+    total_buy_value: number;
+    investors: string[];
+    latest_date: string;
+    transactions: number;
+  }>;
+}
+
+/** GET /api/intraday/:ticker — VWAP + gap + volume profile. */
+export interface IntradayAnalysis {
+  ticker: string;
+  date: string;
+  bars: number;
+  vwap: {
+    vwap: number | null;
+    total_volume: number;
+    total_value: number;
+    bar_count: number;
+    open: number;
+    close: number;
+    high: number;
+    low: number;
+  };
+  opening_gap: {
+    gap_pct: number | null;
+    gap_amount: number | null;
+    open_price: number | null;
+    previous_close: number;
+    direction?: string;
+  };
+  volume_profile: {
+    hours: Record<string, { volume: number; pct: number }>;
+    peak_hour: number | null;
+    total_volume: number;
+    first_30min_pct: number;
+    last_30min_pct: number;
+  };
+}
+
+/** GET /api/foreign-flow — Net foreign buy/sell per ticker. */
+export interface ForeignFlowResult {
+  tickers: Record<string, {
+    net_flow: number;
+    buy_total: number;
+    sell_total: number;
+    days: number;
+    positive_days: number;
+    negative_days: number;
+    trend: string;
+    daily: Array<{ date: string; net: number; buy: number; sell: number }>;
+  }>;
+  days: number;
+}

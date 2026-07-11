@@ -55,11 +55,14 @@ def empty_metrics(ticker: str, reason: str = "") -> dict[str, Any]:
     }
 
 
-def apply_screening_labels(metrics: dict[str, Any], config: ScreenerConfig) -> dict[str, Any]:
+def apply_screening_labels(metrics: dict[str, Any], config: ScreenerConfig, adaptive_min_volume_ratio: float | None = None) -> dict[str, Any]:
     score = calculate_liquidity_score(metrics, config)
     metrics["liquidity_score"] = score
     metrics["liquidity_bucket"] = classify_liquidity_bucket(score)
     metrics["relative_activity_bucket"] = classify_relative_activity(metrics)
+    # Inject adaptive threshold into row for classifier to pick up
+    if adaptive_min_volume_ratio is not None:
+        metrics["_adaptive_min_volume_ratio"] = adaptive_min_volume_ratio
     metrics["trade_candidate_bucket"] = classify_trade_candidate(metrics, config)
     metrics["reason"] = build_reason(metrics, config)
     metrics["signal_summary"] = build_signal_summary(metrics, config)

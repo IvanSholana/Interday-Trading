@@ -43,6 +43,8 @@ def test_get_incremental_ohlcv_fetches_empty_cache_once(tmp_path, monkeypatch) -
         return sample_ohlcv()
 
     monkeypatch.setattr(market_data_cache, "download_yfinance_ohlcv", fake_download)
+    # Force yfinance path so Stockbit doesn't bypass the mock
+    monkeypatch.setattr(market_data_cache, "_DATA_SOURCE", "yfinance")
 
     first = get_incremental_ohlcv("BBCA.JK", "max", db_path=tmp_path / "market.sqlite")
     second = get_incremental_ohlcv("BBCA.JK", "max", db_path=tmp_path / "market.sqlite")

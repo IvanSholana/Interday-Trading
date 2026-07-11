@@ -308,38 +308,56 @@ def _exit_trade(
     exit_index_limit = min(len(history) - 1, entry_index + time_stop_days - 1)
     window = history.iloc[entry_index : exit_index_limit + 1]
 
+    # Use trailing stop enhancement for improved exit logic
+    from .enhancements.trailing_stop import TrailingStopExit
+    trailing = TrailingStopExit(enabled=True)
+
     exit_reason = "TIME_STOP"
     exit_date = window.index[-1]
-    exit_price = float(window.iloc[-1]["close"]) * (1 - config.slippage_pct)
+    exit_price = float(window.iloc[-1]["close"]) * (1 - config.slippage_pct) if not window.empty else actual_entry_price
     exit_position = len(window) - 1
     same_day_ambiguous = False
+    highest_price = actual_entry_price
+    current_sl = stop_loss
 
     for offset, (_, bar) in enumerate(window.iterrows()):
         high = float(bar["high"])
         low = float(bar["low"])
-        tp1_hit = high >= tp1
-        sl_hit = low <= stop_loss
+        holding_days = offset + 1
+
+        # Update highest for trailing
+        highest_price = max(highest_price, high)
+
+        # Trailing stop: tighten SL as profit grows
+        current_sl = trailing.compute_trailing_sl(current_sl, actual_entry_price, highest_price)
+
+        # Time-decay TP: reduce TP target progressively
+        current_tp1 = trailing.compute_decayed_tp(tp1, actual_entry_price, holding_days)
+
+        tp1_hit = high >= current_tp1
+        sl_hit = low <= current_sl
+
         if tp1_hit and sl_hit:
             same_day_ambiguous = True
             if config.same_day_ambiguous_policy == "stop_first":
                 exit_reason = "SL_HIT_SAME_DAY_AMBIGUOUS"
-                exit_price = stop_loss * (1 - config.slippage_pct)
+                exit_price = current_sl * (1 - config.slippage_pct)
             elif config.same_day_ambiguous_policy == "tp_first":
                 exit_reason = "TP1_HIT_SAME_DAY_AMBIGUOUS"
-                exit_price = tp1 * (1 - config.slippage_pct)
+                exit_price = current_tp1 * (1 - config.slippage_pct)
             else:  # skip_trade
                 exit_reason = "AMBIGUOUS_SKIPPED"
                 exit_price = float(bar["close"]) * (1 - config.slippage_pct)
             exit_position = offset
             break
         if sl_hit:
-            exit_reason = "SL_HIT"
-            exit_price = stop_loss * (1 - config.slippage_pct)
+            exit_reason = "TRAILING_SL_HIT" if current_sl > stop_loss else "SL_HIT"
+            exit_price = current_sl * (1 - config.slippage_pct)
             exit_position = offset
             break
         if tp1_hit:
-            exit_reason = "TP1_HIT"
-            exit_price = tp1 * (1 - config.slippage_pct)
+            exit_reason = "TP1_HIT_DECAYED" if current_tp1 < tp1 else "TP1_HIT"
+            exit_price = current_tp1 * (1 - config.slippage_pct)
             exit_position = offset
             break
 
@@ -358,7 +376,7 @@ def _exit_trade(
         "max_adverse_price": max_adverse_price,
         "tp1_hit": bool((exit_window["high"] >= tp1).any()),
         "tp2_hit": bool((exit_window["high"] >= tp2).any()),
-        "sl_hit": bool((exit_window["low"] <= stop_loss).any()),
+        "sl_hit": bool((exit_window["low"] <= stop_loss).any()) or bool(exit_window["low"].min() <= current_sl),
         "time_stop_exit": exit_reason == "TIME_STOP",
         "same_day_ambiguous": same_day_ambiguous,
     }
@@ -560,4 +578,17 @@ def run_stage5_backtest_interday(
     print(f"Trades output saved to: {output_file}")
     print(f"Metrics output saved to: {metrics_file}")
     print(f"Equity output saved to: {equity_file}")
+
+    # P10 Signal Validation: compute statistical quality metrics and append to metrics
+    from .enhancements.signal_validation import SignalValidator
+    validator = SignalValidator(enabled=True)
+    validation = validator.full_validation_report(output)
+    metrics["signal_validation"] = validation
+    # Re-write metrics with validation included
+    metrics_file.write_text(json.dumps(metrics, indent=2, allow_nan=False, default=str), encoding="utf-8")
+    if validation["assessment"] != "ROBUST":
+        print(f"⚠️  Signal validation: {validation['assessment']} — {validation['recommendation']}")
+    else:
+        print(f"✅ Signal validation: ROBUST")
+
     return output

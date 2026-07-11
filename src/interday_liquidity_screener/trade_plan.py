@@ -674,6 +674,16 @@ def calculate_entry_plan(row: dict[str, Any] | pd.Series) -> dict[str, float | s
             "entry_zone_high": close * 1.01,
         }
 
+    # Fallback for bandar-driven candidates: use close as entry.
+    if close > 0:
+        return {
+            "entry_style": "BANDAR_ACCUMULATION_AT_MARKET",
+            "entry_trigger_price": close,
+            "entry_price": close,
+            "entry_zone_low": close * 0.995,
+            "entry_zone_high": close * 1.01,
+        }
+
     return {
         "entry_style": "NO_TRADE",
         "entry_trigger_price": pd.NA,
@@ -702,6 +712,11 @@ def calculate_stop_loss(row: dict[str, Any] | pd.Series, entry_price: float) -> 
         return min(low_20d * 0.99, entry_price - (1.2 * atr14))
     if setup == "WATCH_ENTRY":
         return max(entry_price - (1.3 * atr14), ma50 * 0.98)
+
+    # Fallback for bandar-driven candidates or non-actionable setups:
+    # use ATR-based stop loss (1.5×ATR below entry) as a conservative default.
+    if atr14 > 0 and entry_price > 0:
+        return entry_price - (1.5 * atr14)
     return pd.NA
 
 
@@ -1266,8 +1281,22 @@ def build_trade_plan_row(row: dict[str, Any] | pd.Series, config: TradePlanConfi
 
         # Compute adaptive TP1: must be at least enough to satisfy min_rr_tp1
         # after tick-rounding, while keeping the configured tp1_pct as a floor.
+        # Layer 1: S/R-based TP (nearest resistance levels)
+        from .enhancements.sr_take_profit import SRTakeProfit
+        sr_tp = SRTakeProfit(enabled=True)
+        sr_tp1, sr_tp2 = sr_tp.compute_tp_levels(
+            entry_price=raw_entry_price,
+            row=result,
+            atr14=_value(result, "atr14"),
+            config_tp1_pct=config.tp1_pct,
+            config_tp2_pct=config.tp2_pct,
+        )
+
+        # Layer 2: Fixed % TP as fallback
         fixed_tp1 = raw_entry_price * (1 + config.tp1_pct) if raw_entry_price > 0 else pd.NA
         fixed_tp2 = raw_entry_price * (1 + config.tp2_pct) if raw_entry_price > 0 else pd.NA
+
+        # Layer 3: R:R minimum guarantee (adaptive)
         if raw_entry_price > 0 and pd.notna(raw_stop_loss) and raw_stop_loss < raw_entry_price:
             raw_risk = raw_entry_price - raw_stop_loss
             # Minimum TP1 that guarantees R:R >= min_rr_tp1 even after floor-rounding.
@@ -1276,14 +1305,19 @@ def build_trade_plan_row(row: dict[str, Any] | pd.Series, config: TradePlanConfi
             setup = _plan_setup(result)
             min_rr = config.rebound_min_rr_tp1 if setup == "REBOUND_CANDIDATE" else config.min_rr_tp1
             minimum_tp1 = raw_entry_price + (raw_risk * min_rr) + tick
-            result["raw_take_profit_1"] = max(fixed_tp1, minimum_tp1) if pd.notna(fixed_tp1) else minimum_tp1
 
             min_rr2 = config.rebound_min_rr_tp2 if setup == "REBOUND_CANDIDATE" else config.min_rr_tp2
             minimum_tp2 = raw_entry_price + (raw_risk * min_rr2) + tick
-            result["raw_take_profit_2"] = max(fixed_tp2, minimum_tp2) if pd.notna(fixed_tp2) else minimum_tp2
+
+            # Final TP = max(S/R target, fixed %, R:R minimum)
+            candidates_tp1 = [t for t in [sr_tp1, fixed_tp1, minimum_tp1] if t is not None and not pd.isna(t)]
+            candidates_tp2 = [t for t in [sr_tp2, fixed_tp2, minimum_tp2] if t is not None and not pd.isna(t)]
+            result["raw_take_profit_1"] = max(candidates_tp1) if candidates_tp1 else fixed_tp1
+            result["raw_take_profit_2"] = max(candidates_tp2) if candidates_tp2 else fixed_tp2
         else:
-            result["raw_take_profit_1"] = fixed_tp1
-            result["raw_take_profit_2"] = fixed_tp2
+            # No valid SL → use S/R or fixed
+            result["raw_take_profit_1"] = max(sr_tp1, fixed_tp1) if pd.notna(fixed_tp1) else sr_tp1
+            result["raw_take_profit_2"] = max(sr_tp2, fixed_tp2) if pd.notna(fixed_tp2) else sr_tp2
 
         if raw_entry_price <= 0 or pd.isna(raw_entry_plan["entry_price"]) or pd.isna(raw_stop_loss):
             for column in [
