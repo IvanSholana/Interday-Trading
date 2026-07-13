@@ -1449,6 +1449,17 @@ def api_refresh_stockbit(universe_key: str = "lq45", days: int = 365):
         return JSONResponse(content={"message": result})
 
 
+@app.get("/api/market-movers")
+def api_market_movers(mover_type: str = "top_gainer", limit: int = 20):
+    """Get today's market movers (top gainers, losers, most active)."""
+    from .mcp_server import get_market_movers
+    result = get_market_movers(mover_type=mover_type, limit=limit, output_format="json")
+    try:
+        return JSONResponse(content=json.loads(result))
+    except json.JSONDecodeError:
+        return JSONResponse(content={"error": result}, status_code=400)
+
+
 # ---------------------------------------------------------------------------
 # Static files mount (MUST be last)
 # ---------------------------------------------------------------------------

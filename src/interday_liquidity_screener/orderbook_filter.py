@@ -31,6 +31,11 @@ class OrderbookFilterConfig:
     near_ara_arb_threshold: float = 0.02
     min_intraday_value: float = 5_000_000_000
     min_frequency: int = 100
+    # Tick-aware tolerance: if spread is at most this many ticks,
+    # PASS regardless of spread_pct. This prevents cheap stocks
+    # (Rp200-500, tick=Rp2-5) from being unfairly rejected when their
+    # minimum possible spread already exceeds max_spread_pct.
+    max_spread_ticks_tolerance: int = 2
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -351,8 +356,27 @@ def classify_orderbook(row: dict[str, Any], config: OrderbookFilterConfig) -> st
         return "REJECT_CORPORATE_ACTION_RISK"
     if row.get("near_ara") or row.get("near_arb"):
         return "WAIT_NEAR_ARA_ARB"
-    if row.get("spread_pct") is not None and pd.notna(row.get("spread_pct")) and row["spread_pct"] > config.max_spread_pct:
-        return "WAIT_SPREAD_TOO_WIDE"
+    # Tick-aware spread check: if spread is within max_spread_ticks_tolerance
+    # (e.g. ≤2 ticks), PASS regardless of percentage. This prevents cheap stocks
+    # from being rejected for having a structurally wide spread percentage.
+    spread_pct = row.get("spread_pct")
+    if spread_pct is not None and pd.notna(spread_pct) and spread_pct > config.max_spread_pct:
+        # Before rejecting, check if spread in ticks is within tolerance
+        mid_price = row.get("mid_price")
+        if mid_price is not None and pd.notna(mid_price) and float(mid_price) > 0:
+            from .trade_plan import get_idx_tick_size
+            try:
+                tick = get_idx_tick_size(float(mid_price))
+                spread_amount = float(spread_pct) * float(mid_price)
+                spread_ticks = spread_amount / tick
+                if spread_ticks <= config.max_spread_ticks_tolerance:
+                    pass  # Within tick tolerance — don't reject
+                else:
+                    return "WAIT_SPREAD_TOO_WIDE"
+            except (ValueError, ZeroDivisionError):
+                return "WAIT_SPREAD_TOO_WIDE"
+        else:
+            return "WAIT_SPREAD_TOO_WIDE"
     if row.get("offer_wall_ratio_top5") is not None and pd.notna(row.get("offer_wall_ratio_top5")) and row["offer_wall_ratio_top5"] >= config.max_offer_wall_ratio:
         return "WAIT_OFFER_WALL"
     if row.get("depth_imbalance_top5") is not None and pd.notna(row.get("depth_imbalance_top5")) and row["depth_imbalance_top5"] <= config.min_depth_imbalance:

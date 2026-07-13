@@ -363,6 +363,22 @@ MCP_CAPABILITIES = [
         safety_note="Makes 1 lightweight API call. Does not modify token or any state.",
     ),
     McpToolCapability(
+        name="get_market_movers",
+        category="market_data",
+        mutation_level="read_only",
+        when_to_use="Get today's top gainers, losers, most active stocks. Use for dynamic screening, momentum discovery, or BPJS candidate selection.",
+        output_formats=["json", "markdown"],
+        safety_note="Fetches live data from Stockbit (1 request). Only has data when market is open or just closed same day.",
+    ),
+    McpToolCapability(
+        name="recheck_ticker",
+        category="decision_support",
+        mutation_level="read_only",
+        when_to_use="Re-evaluate a REJECTED ticker when market conditions change (breakout, volume acceleration). Fetches fresh intraday and re-assesses. Call when you see a rejected ticker moving strongly.",
+        output_formats=["json", "markdown"],
+        safety_note="Fetches current intraday data (2-3 requests). Does not modify run artifacts. Returns RECHECK_PASSED/ARMED/STILL_REJECTED with optional sizing.",
+    ),
+    McpToolCapability(
         name="refresh_market_data_stockbit",
         category="market_data",
         mutation_level="writes_cache_artifacts",
@@ -2871,6 +2887,302 @@ def get_dividend_calendar(output_format: str = "json") -> str:
     lines.append("|--------|----------|---------|-----------|-------|-------|")
     for e in events[:20]:
         lines.append(f"| {e.ticker} | {e.cum_date} | {e.ex_date} | Rp{e.dividend_per_share:,.0f} | Rp{e.last_price:,.0f} | {e.yield_pct:.1f}% |")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def recheck_ticker(
+    ticker: str,
+    run_id: str,
+    capital: float = 500_000.0,
+    risk_per_trade_pct: float = 0.02,
+    output_format: str = "json",
+) -> str:
+    """Re-evaluate a previously rejected ticker using CURRENT intraday data.
+
+    Call this when a ticker was rejected in the morning scan but market conditions
+    have changed (breakout, volume acceleration, price above resistance). This
+    fetches fresh intraday data and re-assesses whether the rejection is still valid.
+
+    Args:
+        ticker: IDX ticker to re-evaluate (e.g. 'VKTR').
+        run_id: Original run where ticker was rejected.
+        capital: Current capital for position sizing.
+        risk_per_trade_pct: Risk per trade.
+        output_format: ``json`` or ``markdown``.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    if errors:
+        return _validation_error(errors)
+
+    ticker_clean = ticker.replace(".JK", "").upper()
+    run_dir = DEFAULT_RUN_ROOT / run_id
+
+    # 1. Get original rejection reason
+    original_data = json.loads(get_ticker_stage_details(run_id, ticker_clean, output_format="json"))
+    original_stage4 = original_data.get("stages", {}).get("stage4", {})
+    original_status = original_stage4.get("trade_status", "UNKNOWN")
+    original_entry = original_stage4.get("entry_price", None)
+
+    # 2. Fetch current intraday data
+    from interday_liquidity_screener.stockbit_market_data import (
+        fetch_intraday_candles,
+        fetch_daily_ohlcv_stockbit,
+        compute_vwap,
+        reset_session,
+        StockbitFetchConfig,
+    )
+    reset_session()
+
+    try:
+        intraday = fetch_intraday_candles(ticker_clean, lookback_days=1)
+    except Exception as e:
+        return json.dumps({"error": f"Cannot fetch intraday: {e}"}, indent=2) if output_format == "json" else f"Error: {e}"
+
+    if not intraday:
+        result = {"ticker": ticker_clean, "recheck_status": "NO_INTRADAY_DATA", "action": "Cannot recheck — no intraday data available."}
+        return json.dumps(result, indent=2) if output_format == "json" else result["action"]
+
+    # 3. Compute current metrics
+    trading_date = intraday[-1].datetime[:10]
+    vwap_data = compute_vwap(intraday)
+    current_price = intraday[-1].close
+    current_high = max(b.high for b in intraday)
+    current_low = min(b.low for b in intraday)
+    current_volume = sum(b.volume for b in intraday)
+    vwap = vwap_data.get("vwap", 0)
+    open_price = intraday[0].open
+
+    # 4. Evaluate recheck conditions
+    conditions_met: list[str] = []
+    conditions_failed: list[str] = []
+
+    # Condition A: Price above VWAP (momentum confirmed)
+    if current_price and vwap and current_price > vwap:
+        conditions_met.append(f"PRICE_ABOVE_VWAP (Rp{current_price:,.0f} > VWAP Rp{vwap:,.0f})")
+    else:
+        conditions_failed.append(f"PRICE_BELOW_VWAP (Rp{current_price:,.0f} vs VWAP Rp{vwap:,.0f})")
+
+    # Condition B: Volume acceleration (> 50% of average daily in first hours)
+    try:
+        daily_bars = fetch_daily_ohlcv_stockbit(ticker_clean, days=7,
+                                                 config=StockbitFetchConfig(simulate_session_open=False, max_requests_per_session=5))
+        if daily_bars:
+            avg_daily_vol = sum(b.volume for b in daily_bars[-5:]) / min(5, len(daily_bars))
+            vol_pct_of_daily = current_volume / avg_daily_vol if avg_daily_vol > 0 else 0
+            if vol_pct_of_daily > 0.5:
+                conditions_met.append(f"VOLUME_ACCELERATION ({vol_pct_of_daily*100:.0f}% of avg daily already)")
+            else:
+                conditions_failed.append(f"VOLUME_LOW ({vol_pct_of_daily*100:.0f}% of avg daily)")
+    except Exception:
+        conditions_failed.append("VOLUME_CHECK_UNAVAILABLE")
+
+    # Condition C: Breakout above original entry or resistance
+    if original_entry and current_price > float(original_entry) * 1.01:
+        conditions_met.append(f"BREAKOUT_ABOVE_ENTRY (current Rp{current_price:,.0f} > plan Rp{original_entry})")
+    elif original_entry:
+        conditions_failed.append(f"BELOW_ORIGINAL_ENTRY (current Rp{current_price:,.0f} vs plan Rp{original_entry})")
+
+    # Condition D: Holding above open (gap not faded)
+    if current_price > open_price:
+        conditions_met.append(f"HOLDING_ABOVE_OPEN (Rp{current_price:,.0f} > open Rp{open_price:,.0f})")
+    else:
+        conditions_failed.append(f"FADED_BELOW_OPEN (Rp{current_price:,.0f} < open Rp{open_price:,.0f})")
+
+    # 5. Determine recheck verdict
+    passed = len(conditions_met)
+    total = passed + len(conditions_failed)
+
+    if passed >= 3:
+        recheck_status = "RECHECK_PASSED"
+        action = (
+            f"UPGRADE: {ticker_clean} now shows momentum confirmation. "
+            f"Consider entry at current Rp{current_price:,.0f} with SL below VWAP Rp{vwap:,.0f}."
+        )
+    elif passed >= 2:
+        recheck_status = "RECHECK_ARMED"
+        action = f"MONITOR: {ticker_clean} improving ({passed}/{total} conditions met). Watch for final confirmation."
+    else:
+        recheck_status = "RECHECK_STILL_REJECTED"
+        action = f"HOLD: Original rejection for {ticker_clean} is still valid ({passed}/{total} conditions met)."
+
+    # 6. Simple position sizing if passed
+    sizing = {}
+    if recheck_status == "RECHECK_PASSED" and vwap > 0:
+        sl_price = vwap * 0.985  # SL just below VWAP
+        risk_per_share = current_price - sl_price
+        risk_amount = capital * risk_per_trade_pct
+        lots = int(risk_amount / (risk_per_share * 100)) if risk_per_share > 0 else 0
+        tp_price = current_price + risk_per_share * 1.5  # 1.5:1 R:R
+        sizing = {
+            "entry": current_price,
+            "stop_loss": round(sl_price, 0),
+            "take_profit": round(tp_price, 0),
+            "lots": lots,
+            "position_value": lots * 100 * current_price,
+            "risk_amount": lots * 100 * risk_per_share,
+        }
+
+    result = {
+        "ticker": ticker_clean,
+        "run_id": run_id,
+        "original_status": original_status,
+        "recheck_status": recheck_status,
+        "current_price": current_price,
+        "vwap": vwap,
+        "current_volume": current_volume,
+        "high_today": current_high,
+        "conditions_met": conditions_met,
+        "conditions_failed": conditions_failed,
+        "score": f"{passed}/{total}",
+        "action": action,
+        "sizing": sizing if sizing else None,
+    }
+
+    if output_format == "json":
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+    lines = [
+        f"# Recheck: {ticker_clean}",
+        f"- **Original status**: {original_status}",
+        f"- **Recheck**: **{recheck_status}** ({passed}/{total} conditions)",
+        f"- **Current**: Rp{current_price:,.0f} | VWAP: Rp{vwap:,.0f} | Vol: {current_volume:,}",
+        "",
+        "## Conditions Met ✅" if conditions_met else "",
+    ]
+    for c in conditions_met:
+        lines.append(f"- ✅ {c}")
+    if conditions_failed:
+        lines.append("\n## Conditions Failed ❌")
+        for c in conditions_failed:
+            lines.append(f"- ❌ {c}")
+    lines.extend(["", f"**Action**: {action}"])
+    if sizing:
+        lines.extend([
+            "",
+            "## Suggested Plan",
+            f"- Entry: Rp{sizing['entry']:,.0f}",
+            f"- SL: Rp{sizing['stop_loss']:,.0f} (below VWAP)",
+            f"- TP: Rp{sizing['take_profit']:,.0f} (1.5:1 R:R)",
+            f"- Lots: {sizing['lots']} (Rp{sizing['position_value']:,.0f})",
+        ])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_market_movers(
+    mover_type: str = "top_gainer",
+    limit: int = 20,
+    output_format: str = "json",
+) -> str:
+    """Return today's market movers: top gainers, losers, most active by value/volume/frequency.
+
+    Use this to discover momentum stocks, unusual activity, or screening candidates
+    dynamically from what the market is doing TODAY — instead of only using static universe presets.
+
+    Args:
+        mover_type: One of 'top_gainer', 'top_loser', 'top_value', 'top_volume', 'top_frequency'.
+        limit: Max results to return (1-50).
+        output_format: ``json`` for agents or ``markdown`` for humans.
+    """
+    errors: list[str] = []
+    output_format = _validate_output_format(output_format, errors)
+    allowed_types = {"top_gainer", "top_loser", "top_value", "top_volume", "top_frequency"}
+    if mover_type not in allowed_types:
+        errors.append(f"mover_type must be one of: {', '.join(sorted(allowed_types))}")
+    if limit < 1 or limit > 50:
+        errors.append("limit must be between 1 and 50.")
+    if errors:
+        return _validation_error(errors)
+
+    from interday_liquidity_screener.stockbit_collector import get_stockbit_token, _headers
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+
+    type_map = {
+        "top_gainer": "MOVER_TYPE_TOP_GAINER",
+        "top_loser": "MOVER_TYPE_TOP_LOSER",
+        "top_value": "MOVER_TYPE_TOP_VALUE",
+        "top_volume": "MOVER_TYPE_TOP_VOLUME",
+        "top_frequency": "MOVER_TYPE_TOP_FREQUENCY",
+    }
+
+    token = get_stockbit_token()
+    headers = _headers(token)
+    api_type = type_map[mover_type]
+    url = (
+        f"https://exodus.stockbit.com/order-trade/market-mover"
+        f"?mover_type={api_type}"
+        f"&filter_stocks=FILTER_STOCKS_TYPE_MAIN_BOARD"
+        f"&filter_stocks=FILTER_STOCKS_TYPE_DEVELOPMENT_BOARD"
+        f"&filter_stocks=FILTER_STOCKS_TYPE_ACCELERATION_BOARD"
+        f"&filter_stocks=FILTER_STOCKS_TYPE_NEW_ECONOMY_BOARD"
+    )
+
+    try:
+        req = Request(url, headers=headers)
+        raw = urlopen(req, timeout=15).read().decode("utf-8")
+        data = json.loads(raw).get("data", {})
+    except HTTPError as exc:
+        if exc.code == 401:
+            return json.dumps({"error": "TOKEN_EXPIRED", "message": "Stockbit token expired. Call validate_token for details."}, indent=2)
+        return json.dumps({"error": f"HTTP_{exc.code}", "message": str(exc)}, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": "FETCH_FAILED", "message": str(exc)}, indent=2)
+
+    mover_list = data.get("mover_list", [])[:limit]
+    if not mover_list:
+        if output_format == "json":
+            return json.dumps({"mover_type": mover_type, "count": 0, "movers": [], "note": "Market may be closed or no data available."}, indent=2)
+        return f"No {mover_type} data available. Market may be closed."
+
+    # Parse items
+    parsed: list[dict[str, Any]] = []
+    for item in mover_list:
+        stock = item.get("stock_detail", {})
+        # Fields can be raw values or dicts with 'raw'/'formatted' keys
+        def _raw(v):
+            if isinstance(v, dict):
+                return v.get("raw", 0)
+            return v if v is not None else 0
+
+        change_data = item.get("change", {})
+        change_val = change_data.get("value", 0) if isinstance(change_data, dict) else change_data
+        change_pct = change_data.get("percentage", 0) if isinstance(change_data, dict) else 0
+
+        parsed.append({
+            "symbol": stock.get("code", ""),
+            "name": stock.get("name", ""),
+            "close": item.get("price", _raw(item.get("close", item.get("last", 0)))),
+            "change": change_val,
+            "change_pct": round(change_pct, 2) if isinstance(change_pct, float) else change_pct,
+            "volume": _raw(item.get("volume", 0)),
+            "value": _raw(item.get("value", 0)),
+            "frequency": _raw(item.get("frequency", 0)),
+            "net_foreign_buy": _raw(item.get("net_foreign_buy", 0)),
+            "net_foreign_sell": _raw(item.get("net_foreign_sell", 0)),
+            "has_uma": stock.get("has_uma", False),
+            "corp_action_active": stock.get("corpaction", {}).get("active", False),
+        })
+
+    if output_format == "json":
+        return json.dumps({"mover_type": mover_type, "count": len(parsed), "movers": parsed}, ensure_ascii=False, indent=2, default=str)
+
+    lines = [f"# Market Movers: {mover_type.replace('_', ' ').title()}\n"]
+    lines.append("| Symbol | Name | Price | Change | Volume | Value |")
+    lines.append("|--------|------|-------|--------|--------|-------|")
+    for m in parsed:
+        pct = m["change_pct"]
+        pct_str = f"+{pct}%" if isinstance(pct, (int, float)) and pct > 0 else f"{pct}%"
+        vol = m["volume"]
+        val = m["value"]
+        flags = ""
+        if m["has_uma"]:
+            flags += " ⚠️UMA"
+        if m["corp_action_active"]:
+            flags += " ⚠️CA"
+        lines.append(f"| {m['symbol']}{flags} | {m['name'][:20]} | Rp{m['close']:,} | {pct_str} | {vol:,} | {val:,} |")
     return "\n".join(lines)
 
 

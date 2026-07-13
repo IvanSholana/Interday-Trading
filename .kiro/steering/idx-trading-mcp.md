@@ -85,6 +85,14 @@ Keduanya harus ALIGN sebelum rekomendasi. Jika sentimen bullish tapi smart money
 2. diagnose_run on each → understand differences
 ```
 
+### Rejected ticker breakout / "kenapa ga masuk X padahal naik?"
+```
+1. recheck_ticker(ticker, run_id) → re-evaluate with fresh intraday data
+2. IF RECHECK_PASSED: show new entry plan (VWAP-based SL)
+3. IF RECHECK_ARMED: monitor, call again in 15-30 min
+4. IF STILL_REJECTED: original rejection valid, jangan FOMO
+```
+
 ### Weekend / Market Closed
 ```
 NEVER run pipeline (no new data).
@@ -128,6 +136,18 @@ Always structure your response to the user as:
 2. **Temuan** — Key findings from tools (insider, watchlist, scores)
 3. **Rekomendasi** — Specific actionable guidance
 4. **Catatan risiko** — Caveats (this is decision support, not order instruction)
+
+### CRITICAL: Presentation Rules by Status
+
+- **EXECUTION_READY / EXECUTION_DRAFT**: Show full trade plan (entry, TP, SL, lots, R:R)
+- **NEED_ORDERBOOK**: Show plan but prefix with "⚠️ Belum dikonfirmasi orderbook"
+- **EARLY_WATCH / WATCH_ONLY**: **JANGAN tampilkan angka entry/TP/SL sebagai trade plan.** Cukup bilang:
+  - "Pantau di area Rp[X]-Rp[Y]"
+  - "Entry hanya jika [kondisi] terpenuhi"
+  - "Belum layak trade — status hanya WATCH"
+- **SKIP / REJECT**: Bilang "Ditolak karena [alasan]". Tidak perlu tampilkan angka.
+
+**ALASAN**: Menampilkan entry/TP/SL untuk kandidat WATCH membuat user mengira itu trade plan operasional. Ini yang menyebabkan kerugian MEDC — plan ditampilkan padahal status hanya WATCH.
 
 ## Anti-patterns to AVOID
 

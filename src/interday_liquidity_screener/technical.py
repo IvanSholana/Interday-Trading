@@ -700,6 +700,7 @@ def run_stage_2_technical_screening(
     period: str = "1y",
     market_data_db: str | Path = DEFAULT_MARKET_DATA_DB,
     refresh_market_data: bool = False,
+    drop_partial_today: bool = False,
 ) -> pd.DataFrame:
     candidates = load_stage_1_candidates(input_path)
     print(f"Stage 1 candidates loaded: {len(candidates)}")
@@ -715,6 +716,19 @@ def run_stage_2_technical_screening(
         market_data_db=market_data_db,
         refresh_market_data=refresh_market_data,
     )
+
+    # If running during market hours, drop today's partial bar from each history
+    # so volume_ratio is computed from yesterday's complete bar instead.
+    if drop_partial_today:
+        from datetime import date as _date_type
+        today_ts = pd.Timestamp(_date_type.today())
+        dropped = 0
+        for tkr, df in histories.items():
+            if not df.empty and df.index[-1] >= today_ts:
+                histories[tkr] = df.iloc[:-1]
+                dropped += 1
+        if dropped:
+            print(f"⚠️  Dropped today's partial bar from {dropped} tickers (market still open)")
 
     for _, candidate in candidates.iterrows():
         yahoo_ticker = candidate["yahoo_ticker"]

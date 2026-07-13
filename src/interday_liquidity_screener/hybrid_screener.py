@@ -365,10 +365,27 @@ def score_orderbook(row: dict[str, Any], config: HybridScreenerConfig, mode: str
         if spread_pct <= cfg.max_spread_pct_bpjs:
             score += 12
         else:
-            score -= 20
-            warnings.append("spread_pct_too_wide")
-            if mode == "bpjs_live":
-                flags.append("ORDERBOOK_REJECT")
+            # Tick-aware tolerance: if spread is ≤2 ticks, don't penalize
+            # even if spread_pct looks wide (cheap stocks have structurally wider %)
+            is_within_tick_tolerance = False
+            if spread_ticks is not None and spread_ticks <= 2:
+                is_within_tick_tolerance = True
+            elif best_bid is not None and best_bid > 0:
+                try:
+                    tick = get_idx_tick_size(best_bid)
+                    actual_spread = spread_pct * best_bid
+                    if actual_spread / tick <= 2:
+                        is_within_tick_tolerance = True
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+            if is_within_tick_tolerance:
+                score += 5  # Mild bonus — spread is structurally tight for this price range
+            else:
+                score -= 20
+                warnings.append("spread_pct_too_wide")
+                if mode == "bpjs_live":
+                    flags.append("ORDERBOOK_REJECT")
     if spread_ticks is not None and mode == "bpjs_live" and spread_ticks > cfg.max_spread_ticks_bpjs:
         flags.append("ORDERBOOK_REJECT")
         warnings.append("spread_ticks_too_wide_for_bpjs")
@@ -1135,6 +1152,46 @@ def build_hybrid_watchlist(
                 )
     except Exception:
         pass  # Non-critical — insider data is a boost, not a gate
+
+    # P13 External bandar scan injection: if scan_bandar_activity found tickers
+    # that Stage 3A/3B missed (NO_BROKER_DATA), inject accumulation evidence.
+    # This fixes the disconnect where external scan confirms accumulation but
+    # pipeline's own Stage 3B doesn't have the data.
+    try:
+        from .bandar_tracker import run_bandar_scan
+        import logging as _logging
+        _bandar_logger = _logging.getLogger(__name__)
+        bandar_df = run_bandar_scan(force_refresh=False)  # Use cached scan from today
+        if bandar_df is not None and not bandar_df.empty:
+            tkr_col = "symbol" if "symbol" in candidates.columns else "ticker"
+            bandar_tickers = set()
+            # Extract ticker column from bandar scan results
+            for col in ["ticker", "symbol", "code"]:
+                if col in bandar_df.columns:
+                    bandar_tickers = set(bandar_df[col].astype(str).str.replace(".JK", "").str.upper())
+                    break
+            if bandar_tickers:
+                # For candidates that have NO_BROKER_DATA but appear in bandar scan,
+                # inject a minimum accumulation marker so they aren't hard-skipped.
+                def _inject_bandar(row):
+                    tkr = str(row.get(tkr_col, "")).replace(".JK", "").upper()
+                    signal = str(row.get("bandarmology_signal", ""))
+                    if tkr in bandar_tickers and signal in ("NO_BROKER_DATA", "", "nan"):
+                        return True
+                    return False
+
+                mask = candidates.apply(_inject_bandar, axis=1)
+                if mask.any():
+                    candidates.loc[mask, "bandarmology_signal"] = "MILD_ACCUMULATION"
+                    candidates.loc[mask, "bandarmology_score"] = candidates.loc[mask, "bandarmology_score"].fillna(65)
+                    candidates.loc[mask, "broker_activity_available"] = True
+                    _bandar_logger.info(
+                        "P13: Injected external bandar evidence for %d tickers: %s",
+                        mask.sum(),
+                        candidates.loc[mask, tkr_col].tolist()[:10],
+                    )
+    except Exception:
+        pass  # Non-critical — best-effort injection
 
     # P12 Dividend ex-date blackout: block tickers on/near ex-date
     exdate_blocked_tickers: set[str] = set()

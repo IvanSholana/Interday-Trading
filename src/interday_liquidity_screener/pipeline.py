@@ -484,6 +484,21 @@ def run_stage1_screening(tickers_file: str | Path, output_path: str | Path, opti
     print(f"Total tickers loaded: {len(tickers)}")
     data_map = download_ticker_data(tickers, config)
 
+    # Detect if running during market hours (bar today is incomplete).
+    # If so, volume_ratio is unreliable and should not block candidates.
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    _wib = _tz(_td(hours=7))
+    _now_wib = _dt.now(_wib)
+    _market_closed_hour = 16
+    _market_closed_min = 30
+    _running_during_market = (
+        _now_wib.weekday() < 5
+        and _now_wib.hour < _market_closed_hour
+        or (_now_wib.hour == _market_closed_hour and _now_wib.minute < _market_closed_min)
+    )
+    if _running_during_market and _now_wib.hour >= 9:
+        print("⚠️  Pipeline running during market hours — volume_ratio gate disabled (bar incomplete)")
+
     # P6: Compute adaptive threshold if enabled
     adaptive_min_vol_ratio: float | None = None
     if config.enable_adaptive_threshold:
@@ -522,6 +537,12 @@ def run_stage1_screening(tickers_file: str | Path, output_path: str | Path, opti
         for row in rows:
             row["_adaptive_min_volume_ratio"] = adaptive_min_vol_ratio
 
+    # If running during market hours, disable volume_ratio gate
+    # by setting effective threshold to near-zero
+    if _running_during_market and _now_wib.hour >= 9:
+        for row in rows:
+            row["_adaptive_min_volume_ratio"] = 0.01  # Effectively disabled
+
     output = build_result_frame(rows)
     save_csv(output, output_path)
     print(f"Stage 1 output saved to: {output_path}")
@@ -544,6 +565,16 @@ def run_pipeline(
     paths.run_dir.mkdir(parents=True, exist_ok=True)
     results: list[StageRunResult] = []
 
+    # Detect if running during market hours (partial bar issue)
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    _wib = _tz(_td(hours=7))
+    _now_wib = _dt.now(_wib)
+    _running_during_market = (
+        _now_wib.weekday() < 5
+        and 9 <= _now_wib.hour < 16
+        or (_now_wib.hour == 16 and _now_wib.minute < 30)
+    )
+
     if "stage1" in stage_set:
         results.append(capture_stage("Stage 1 - Liquidity", paths.stage1, lambda: run_stage1_screening(options.tickers_file, paths.stage1, options), resume=resume))
     if _last_failed(results):
@@ -560,6 +591,7 @@ def run_pipeline(
                     period=options.period_stage2,
                     market_data_db=options.market_data_db,
                     refresh_market_data=options.refresh_market_data,
+                    drop_partial_today=_running_during_market and _now_wib.hour >= 9,
                 ),
                 resume=resume,
             )
